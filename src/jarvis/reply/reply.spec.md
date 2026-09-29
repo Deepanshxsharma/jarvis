@@ -375,6 +375,17 @@ Behaviour:
 - **User-facing logging**: prints `🧩 Tool digest: N chars — "preview…"` when the digest replaces the raw payload, or the NONE fallback line above. Debug logs under the `tools` category record raw→digest size plus batch counts.
 - **Raw payload preserved in debug**: the debug logs capture the original length so field captures can compare digested vs raw behaviour.
 
+### Stage Timing
+Every reply records how long each stage took (`src/jarvis/reply/timing.py`). `run_reply_engine` starts a `ReplyTiming` record, runs the flow, and prints one line when the reply finishes, whether it succeeded or failed:
+
+```
+⏱️ REPLY router=187ms planner=634ms resolve=698ms tools=1.74s digest=3.77s llm=4.00s tokens=5135in/36out total=11.09s
+```
+
+- Stages: `mcp_refresh`, `router`, `planner`, `memory` (extractor, diary search and memory digest), `resolve` (plan-step argument resolver), `tools`, `digest` (tool-result digest) and `llm` (chat-model turns). A stage that ran more than once shows its count (`llm=3.1sx2`). Stages that did not run are omitted.
+- `tokens` sums the chat model's `prompt_eval_count` and `eval_count` across the reply's `llm` turns, so prompt-size regressions show up in the field.
+- The record lives in a context variable, so replies on different threads never mix. `last_reply_timing()` returns the most recent record for benchmarks and tests.
+
 ### Logging and Privacy
 - Use `debug_log` for key steps: `memory`, `planning`, and `voice` categories.
 - Avoid excessive logging; logs must remain readable and privacy-preserving.

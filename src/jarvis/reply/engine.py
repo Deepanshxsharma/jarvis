@@ -32,13 +32,19 @@ def chat_with_messages(cfg, messages, *, timeout_sec=30.0, extra_options=None,
     to capture every chat call rather than reaching into the backend ABC.
     """
     backend = get_llm_backend(cfg)
-    return backend.chat(
-        cfg.llm_chat_model, messages,
-        timeout_sec=timeout_sec,
-        extra_options=extra_options,
-        tools=tools,
-        thinking=thinking,
-    )
+    with _timing.stage("llm"):
+        response = backend.chat(
+            cfg.llm_chat_model, messages,
+            timeout_sec=timeout_sec,
+            extra_options=extra_options,
+            tools=tools,
+            thinking=thinking,
+        )
+    _active_timing = _timing.current()
+    if _active_timing is not None:
+        _active_timing.record_llm_usage(response)
+    return response
+from . import timing as _timing
 from .enrichment import (
     extract_search_params_for_memory,
     digest_memory_for_query,
@@ -579,15 +585,16 @@ def _maybe_digest_tool_result(
         return raw_tool_result
 
     try:
-        digested = digest_tool_result_for_query(
-            query=query,
-            tool_name=tool_name,
-            tool_result=raw_tool_result,
-            cfg=cfg,
-            chat_model=cfg.llm_chat_model,
-            timeout_sec=float(getattr(cfg, 'llm_digest_timeout_sec', 8.0)),
-            thinking=getattr(cfg, 'llm_thinking_enabled', False),
-        )
+        with _timing.stage("digest"):
+            digested = digest_tool_result_for_query(
+                query=query,
+                tool_name=tool_name,
+                tool_result=raw_tool_result,
+                cfg=cfg,
+                chat_model=cfg.llm_chat_model,
+                timeout_sec=float(getattr(cfg, 'llm_digest_timeout_sec', 8.0)),
+                thinking=getattr(cfg, 'llm_thinking_enabled', False),
+            )
     except Exception as e:
         debug_log(
             f"tool result digest step failed (non-fatal): {e}",
@@ -781,6 +788,28 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
                     text: str, dialogue_memory: "DialogueMemory",
                     language: Optional[str] = None,
                     quiet: bool = False) -> Optional[str]:
+    """Generate a reply, recording how long each stage took.
+
+    See :func:`_run_reply_engine_body` for the flow. The finished timing is
+    printed as a ``⏱️ REPLY ...`` line and kept for
+    :func:`jarvis.reply.timing.last_reply_timing`.
+    """
+    timing = _timing.begin()
+    try:
+        return _run_reply_engine_body(
+            db, cfg, tts, text, dialogue_memory,
+            language=language, quiet=quiet,
+        )
+    finally:
+        timing.finish()
+        print(f"  ⏱️ {timing.format()}", flush=True)
+        debug_log(timing.format(), "planning")
+
+
+def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
+                           text: str, dialogue_memory: "DialogueMemory",
+                           language: Optional[str] = None,
+                           quiet: bool = False) -> Optional[str]:
     """
     Main entry point for reply generation.
 
@@ -843,7 +872,8 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
             from ..tools.registry import refresh_mcp_tools, is_mcp_cache_initialized
             if is_mcp_cache_initialized():
                 debug_log("New conversation detected, refreshing MCP tools", "mcp")
-                _tools, _errors = refresh_mcp_tools(verbose=False)
+                with _timing.stage("mcp_refresh"):
+                    _tools, _errors = refresh_mcp_tools(verbose=False)
         except Exception as e:
             debug_log(f"MCP refresh on new conversation failed: {e}", "mcp")
 
@@ -921,19 +951,20 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
         routed_tools = list(_cached_routed)
         debug_log("tool router served from hot-window cache", "planning")
     else:
-        routed_tools = select_tools(
-            query=redacted,
-            builtin_tools=BUILTIN_TOOLS,
-            mcp_tools=mcp_tools,
-            strategy=strategy,
-            llm_backend=get_llm_backend(cfg),
-            llm_model=resolve_model(cfg, Tier.FAST),
-            llm_timeout_sec=float(getattr(cfg, "llm_tools_timeout_sec", 8.0)),
-            embedding_backend=get_embedding_backend(cfg),
-            embed_model=cfg.embedding_model,
-            embed_timeout_sec=float(getattr(cfg, "llm_embedding_timeout_sec", 10.0)),
-            context_hint=context_hint,
-        )
+        with _timing.stage("router"):
+            routed_tools = select_tools(
+                query=redacted,
+                builtin_tools=BUILTIN_TOOLS,
+                mcp_tools=mcp_tools,
+                strategy=strategy,
+                llm_backend=get_llm_backend(cfg),
+                llm_model=resolve_model(cfg, Tier.FAST),
+                llm_timeout_sec=float(getattr(cfg, "llm_tools_timeout_sec", 8.0)),
+                embedding_backend=get_embedding_backend(cfg),
+                embed_model=cfg.embedding_model,
+                embed_timeout_sec=float(getattr(cfg, "llm_embedding_timeout_sec", 10.0)),
+                context_hint=context_hint,
+            )
         # Don't cache the router's "fall open to all tools" fallback. That
         # path fires when the LLM router times out, returns empty, or emits
         # a response no token of which matches a known tool name — i.e. the
@@ -1037,12 +1068,13 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
         )
     else:
         try:
-            action_plan = plan_query(
-                cfg=cfg,
-                query=redacted,
-                dialogue_context=_dialogue_ctx,
-                tools=_planner_tool_catalog,
-            )
+            with _timing.stage("planner"):
+                action_plan = plan_query(
+                    cfg=cfg,
+                    query=redacted,
+                    dialogue_context=_dialogue_ctx,
+                    tools=_planner_tool_catalog,
+                )
         except Exception as _plan_exc:  # pragma: no cover — defensive
             debug_log(f"planner step failed (non-fatal): {_plan_exc}", "planning")
             action_plan = []
@@ -1195,12 +1227,13 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
                 search_params = _cached_params
                 debug_log("memory extractor served from hot-window cache", "memory")
             else:
-                search_params = extract_search_params_for_memory(
-                    _extractor_query, cfg, resolve_model(cfg, Tier.FAST),
-                    timeout_sec=float(getattr(cfg, 'llm_tools_timeout_sec', 8.0)),
-                    thinking=getattr(cfg, 'llm_thinking_enabled', False),
-                    context_hint=context_hint,
-                )
+                with _timing.stage("memory"):
+                    search_params = extract_search_params_for_memory(
+                        _extractor_query, cfg, resolve_model(cfg, Tier.FAST),
+                        timeout_sec=float(getattr(cfg, 'llm_tools_timeout_sec', 8.0)),
+                        thinking=getattr(cfg, 'llm_thinking_enabled', False),
+                        context_hint=context_hint,
+                    )
                 if dialogue_memory and hasattr(dialogue_memory, "hot_cache_put"):
                     dialogue_memory.hot_cache_put(_extractor_cache_key, search_params)
             keywords = search_params.get('keywords', [])
@@ -1223,16 +1256,17 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
             debug_log(f"diary search: keywords={keywords}, from={from_time}, to={to_time}", "memory")
 
             from ..memory.conversation import search_conversation_memory_by_keywords
-            context_results = search_conversation_memory_by_keywords(
-                db=db,
-                keywords=keywords,
-                cfg=cfg,
-                from_time=from_time,
-                to_time=to_time,
-                timeout_sec=float(getattr(cfg, 'llm_embedding_timeout_sec', 10.0)),
-                voice_debug=cfg.voice_debug,
-                max_results=cfg.memory_enrichment_max_results,
-            )
+            with _timing.stage("memory"):
+                context_results = search_conversation_memory_by_keywords(
+                    db=db,
+                    keywords=keywords,
+                    cfg=cfg,
+                    from_time=from_time,
+                    to_time=to_time,
+                    timeout_sec=float(getattr(cfg, 'llm_embedding_timeout_sec', 10.0)),
+                    voice_debug=cfg.voice_debug,
+                    max_results=cfg.memory_enrichment_max_results,
+                )
             if context_results:
                 raw_diary_entries = list(context_results)
                 conversation_context = "\n".join(context_results)
@@ -1332,15 +1366,16 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
 
     if digest_enabled and (raw_diary_entries or raw_graph_parts):
         try:
-            digest = digest_memory_for_query(
-                query=redacted,
-                diary_entries=raw_diary_entries,
-                graph_parts=raw_graph_parts,
-                cfg=cfg,
-                chat_model=cfg.llm_chat_model,
-                timeout_sec=float(getattr(cfg, 'llm_digest_timeout_sec', 8.0)),
-                thinking=getattr(cfg, 'llm_thinking_enabled', False),
-            )
+            with _timing.stage("memory"):
+                digest = digest_memory_for_query(
+                    query=redacted,
+                    diary_entries=raw_diary_entries,
+                    graph_parts=raw_graph_parts,
+                    cfg=cfg,
+                    chat_model=cfg.llm_chat_model,
+                    timeout_sec=float(getattr(cfg, 'llm_digest_timeout_sec', 8.0)),
+                    thinking=getattr(cfg, 'llm_thinking_enabled', False),
+                )
             # Replace the raw injections with the digest note (or nothing
             # when the distil decided nothing was relevant). Downstream
             # `_build_initial_system_message` reads these two locals.
@@ -1852,12 +1887,13 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
                 _plan_exec_handled = False
                 try:
                     _prior = list(invoked_tools_history)
-                    _resolved = _resolve_plan_step(
-                        cfg=cfg,
-                        next_step_text=_plan_tool_steps[_tool_results_so_far],
-                        prior_results=_prior,
-                        tools_schema=tools_json_schema or [],
-                    )
+                    with _timing.stage("resolve"):
+                        _resolved = _resolve_plan_step(
+                            cfg=cfg,
+                            next_step_text=_plan_tool_steps[_tool_results_so_far],
+                            prior_results=_prior,
+                            tools_schema=tools_json_schema or [],
+                        )
                     if _resolved is not None:
                         _name, _args = _resolved
                         try:
@@ -1919,17 +1955,18 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
                                     }
                                 ],
                             })
-                            _plan_result = run_tool_with_retries(
-                                db=db,
-                                cfg=cfg,
-                                tool_name=_name,
-                                tool_args=_args,
-                                system_prompt=_persona_prompt,
-                                original_prompt="",
-                                redacted_text=redacted,
-                                max_retries=1,
-                                language=language,
-                            )
+                            with _timing.stage("tools"):
+                                _plan_result = run_tool_with_retries(
+                                    db=db,
+                                    cfg=cfg,
+                                    tool_name=_name,
+                                    tool_args=_args,
+                                    system_prompt=_persona_prompt,
+                                    original_prompt="",
+                                    redacted_text=redacted,
+                                    max_retries=1,
+                                    language=language,
+                                )
                             if _plan_result.reply_text:
                                 _plan_text = _maybe_digest_tool_result(
                                     cfg=cfg,
@@ -2207,17 +2244,18 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
                 continue
 
             # Execute tool
-            result = run_tool_with_retries(
-                db=db,
-                cfg=cfg,
-                tool_name=tool_name,
-                tool_args=tool_args,
-                system_prompt=_persona_prompt,
-                original_prompt="",
-                redacted_text=redacted,
-                max_retries=1,
-                language=language,
-            )
+            with _timing.stage("tools"):
+                result = run_tool_with_retries(
+                    db=db,
+                    cfg=cfg,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    system_prompt=_persona_prompt,
+                    original_prompt="",
+                    redacted_text=redacted,
+                    max_retries=1,
+                    language=language,
+                )
 
             # Handle stop tool - end conversation without response
             if result.reply_text == STOP_SIGNAL:
