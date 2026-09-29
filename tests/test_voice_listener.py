@@ -28,6 +28,9 @@ def _create_mock_config(**kwargs):
     mock_cfg.voice_debug = kwargs.get("voice_debug", False)
     mock_cfg.vad_frame_ms = kwargs.get("vad_frame_ms", 20)
     mock_cfg.tune_enabled = kwargs.get("tune_enabled", False)
+    # Every other attribute is a truthy MagicMock, which would send real
+    # warmup requests from background threads that outlive the test.
+    mock_cfg.low_power_mode = kwargs.get("low_power_mode", True)
     return mock_cfg
 
 

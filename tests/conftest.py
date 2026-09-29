@@ -132,6 +132,29 @@ def _isolate_user_config_path(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("JARVIS_CONFIG_PATH", str(sandbox / "config.json"))
 
 
+@pytest.fixture(autouse=True)
+def _stop_leaked_thinking_tunes(monkeypatch):
+    """Stop any thinking tune a test leaves playing.
+
+    Listener tests that accept a query start a real ``TunePlayer``; left
+    running, each one holds an open audio output stream for the rest of
+    the session and starves timing-sensitive tests.
+    """
+    from jarvis.output.tune_player import TunePlayer
+
+    started = []
+    original_start = TunePlayer.start_tune
+
+    def tracking_start(self):
+        started.append(self)
+        original_start(self)
+
+    monkeypatch.setattr(TunePlayer, "start_tune", tracking_start)
+    yield
+    for player in started:
+        player.stop_tune()
+
+
 @pytest.fixture
 def mock_config():
     """Provide a mock configuration for unit tests."""

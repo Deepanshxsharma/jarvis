@@ -1173,8 +1173,9 @@ class TestInstallUpdateMacos:
             f"script failed: stdout={result.stdout!r} stderr={result.stderr!r}"
         )
 
-        # The fallback is backgrounded via nohup, give it a moment to run.
-        for _ in range(20):
+        # The fallback is backgrounded via nohup; a loaded machine can take
+        # seconds to schedule it.
+        for _ in range(100):
             if marker_path.exists():
                 break
             time.sleep(0.1)

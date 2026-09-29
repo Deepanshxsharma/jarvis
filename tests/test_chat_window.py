@@ -19,6 +19,17 @@ from __future__ import annotations
 import pytest
 
 
+def _wait_until(condition, timeout_ms=5000):
+    """Let Qt run until ``condition()`` holds, instead of guessing a delay."""
+    from PyQt6.QtTest import QTest
+
+    for _ in range(timeout_ms // 10):
+        if condition():
+            return True
+        QTest.qWait(10)
+    return condition()
+
+
 @pytest.mark.unit
 class TestPhoneShell:
     def test_window_controls_and_rounded_frame(self, qapp, monkeypatch):
@@ -677,7 +688,6 @@ class TestChatWindowTranscriptScroll:
 
     def test_append_scrolls_to_bottom_after_many_lines(self, qapp, monkeypatch):
         from desktop_app.chat_window import ChatWindow
-        from PyQt6.QtTest import QTest
 
         monkeypatch.setattr(
             "desktop_app.chat_window.get_hot_window_messages", lambda: []
@@ -689,16 +699,16 @@ class TestChatWindowTranscriptScroll:
         # lines. Each append must bring the cursor (the view) back to the end.
         for _ in range(80):
             win._append_assistant("line of transcript content " * 4)
-        QTest.qWait(100)
 
         scroll_bar = win.transcript_widget.verticalScrollBar()
-        assert scroll_bar.maximum() > 0
-        assert scroll_bar.value() == scroll_bar.maximum()
+        assert _wait_until(
+            lambda: scroll_bar.maximum() > 0
+            and scroll_bar.value() == scroll_bar.maximum()
+        )
 
     @pytest.mark.parametrize("kind", ["user", "assistant", "system"])
     def test_new_message_scrolls_to_bottom_from_scrolled_up_position(self, qapp, monkeypatch, kind):
         from desktop_app.chat_window import ChatWindow
-        from PyQt6.QtTest import QTest
 
         monkeypatch.setattr("desktop_app.chat_window.get_hot_window_messages", lambda: [])
 
@@ -706,16 +716,22 @@ class TestChatWindowTranscriptScroll:
         win.show()
         for index in range(80):
             win._append_assistant(f"older message {index} " * 4)
-        QTest.qWait(100)
 
         scroll_bar = win.transcript_widget.verticalScrollBar()
+        assert _wait_until(
+            lambda: scroll_bar.maximum() > 0
+            and scroll_bar.value() == scroll_bar.maximum()
+        )
         scroll_bar.setValue(scroll_bar.minimum())
         assert scroll_bar.value() < scroll_bar.maximum()
+        maximum_before = scroll_bar.maximum()
 
         getattr(win, f"_append_{kind}")("newest message")
-        QTest.qWait(100)
 
-        assert scroll_bar.value() == scroll_bar.maximum()
+        assert _wait_until(
+            lambda: scroll_bar.maximum() > maximum_before
+            and scroll_bar.value() == scroll_bar.maximum()
+        )
 
 
 @pytest.mark.unit
