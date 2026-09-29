@@ -13,6 +13,7 @@ plus the same args and forwards to the matching backend method.
 """
 
 from __future__ import annotations
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional
 
@@ -122,12 +123,19 @@ class LLMBackend(ABC):
         extra_options: Optional[Dict[str, Any]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         thinking: bool = False,
+        on_text: Optional[Callable[[str], None]] = None,
+        cancel: Optional[threading.Event] = None,
     ) -> Optional[Dict[str, Any]]:
         """Arbitrary-messages chat. Returns the raw response dict so the
         caller (today: the reply engine) can inspect both content and
         ``tool_calls``. Raises :class:`ToolsNotSupportedError` when the
         model rejects the ``tools`` parameter so the caller can fall
-        back to text-based tool calling without losing the turn."""
+        back to text-based tool calling without losing the turn.
+
+        ``on_text`` receives the assistant content as it is generated
+        (backends that cannot stream deliver it once, complete). When
+        ``cancel`` is set the backend stops generating and returns
+        ``None``."""
 
     @abstractmethod
     def embed(

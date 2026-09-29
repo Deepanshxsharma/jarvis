@@ -71,6 +71,7 @@ Budget memory for Whisper and, when different from chat, the fast model used for
 - **Get things done.** Built-in tools cover web search, weather, time, screenshot OCR, file access, nutrition tracking and optional location awareness.
 - **Connect your own tools.** MCP servers add browser automation, smart-home controls and other integrations. Tool routing selects a relevant subset for each request.
 - **Dictate into other apps.** Hold a hotkey, speak, then release to paste locally transcribed text. See the [platform limitations](#known-limitations) first.
+- **Hear answers sooner.** With Piper, Jarvis starts speaking as soon as the first sentence of a reply is ready. Stopping it mid-reply also stops the rest being generated.
 - **Type when you need to.** The companion chat shares your voice conversation and memory. Text replies are silent, and you can rewind a sent message to regenerate from that point.
 
 ### Bring Jarvis into the discussion

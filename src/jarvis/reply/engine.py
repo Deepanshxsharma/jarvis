@@ -5,7 +5,8 @@ Handles memory enrichment, tool planning and execution.
 """
 
 from __future__ import annotations
-from typing import Optional, TYPE_CHECKING
+import threading
+from typing import Callable, Optional, TYPE_CHECKING
 
 from ..utils.redact import redact
 from ..system_prompt import build_system_prompt
@@ -23,7 +24,7 @@ from ..llm import (
 
 
 def chat_with_messages(cfg, messages, *, timeout_sec=30.0, extra_options=None,
-                       tools=None, thinking=False):
+                       tools=None, thinking=False, on_text=None, cancel=None):
     """Local indirection: route the engine's chat call through the active
     backend (Ollama or OpenAI-compatible, per ``cfg.llm_provider``) so the
     runtime swap is transparent to the rest of the engine.
@@ -32,6 +33,11 @@ def chat_with_messages(cfg, messages, *, timeout_sec=30.0, extra_options=None,
     to capture every chat call rather than reaching into the backend ABC.
     """
     backend = get_llm_backend(cfg)
+    streaming = {}
+    if on_text is not None:
+        streaming["on_text"] = on_text
+    if cancel is not None:
+        streaming["cancel"] = cancel
     with _timing.stage("llm"):
         response = backend.chat(
             cfg.llm_chat_model, messages,
@@ -39,6 +45,7 @@ def chat_with_messages(cfg, messages, *, timeout_sec=30.0, extra_options=None,
             extra_options=extra_options,
             tools=tools,
             thinking=thinking,
+            **streaming,
         )
     _active_timing = _timing.current()
     if _active_timing is not None:
@@ -54,6 +61,7 @@ from .enrichment import (
 from .prompt_dump import dump_reply_turn, is_enabled as _prompt_dump_enabled, new_session_id
 from .prompts import ModelSize, detect_model_size, get_system_prompts
 from .compound_query import split_compound_query
+from .speech_stream import SpeechStreamer
 from .planner import (
     plan_query,
     format_plan_block,
@@ -787,18 +795,26 @@ def _build_enrichment_context_hint(cfg, recent_messages: list) -> Optional[str]:
 def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
                     text: str, dialogue_memory: "DialogueMemory",
                     language: Optional[str] = None,
-                    quiet: bool = False) -> Optional[str]:
+                    quiet: bool = False,
+                    on_speech: Optional[Callable[[str], None]] = None,
+                    cancel_event: Optional[threading.Event] = None) -> Optional[str]:
     """Generate a reply, recording how long each stage took.
 
     See :func:`_run_reply_engine_body` for the flow. The finished timing is
     printed as a ``⏱️ REPLY ...`` line and kept for
     :func:`jarvis.reply.timing.last_reply_timing`.
+
+    ``on_speech`` receives the reply as speakable sentences while the chat
+    model is still generating; by the time the engine returns, the whole
+    reply has gone through it and ``tts`` is not used. ``cancel_event``
+    stops the reply: generation is aborted and ``None`` is returned.
     """
     timing = _timing.begin()
     try:
         return _run_reply_engine_body(
             db, cfg, tts, text, dialogue_memory,
             language=language, quiet=quiet,
+            on_speech=on_speech, cancel_event=cancel_event,
         )
     finally:
         timing.finish()
@@ -809,7 +825,9 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
 def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                            text: str, dialogue_memory: "DialogueMemory",
                            language: Optional[str] = None,
-                           quiet: bool = False) -> Optional[str]:
+                           quiet: bool = False,
+                           on_speech: Optional[Callable[[str], None]] = None,
+                           cancel_event: Optional[threading.Event] = None) -> Optional[str]:
     """
     Main entry point for reply generation.
 
@@ -1856,7 +1874,15 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
     # to the steps of the current plan.
     _plan_steps_baseline = sum(1 for m in messages if m.get("tool_name"))
 
+    speech = SpeechStreamer(on_speech) if on_speech is not None else None
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     while turn < max_turns:
+        if _cancelled():
+            debug_log("reply cancelled before the next turn", "planning")
+            return None
         turn += 1
         debug_log(f"🔁 messages loop turn {turn}", "planning")
         print(f"  🔁 Turn {turn}/{max_turns}", flush=True)
@@ -2051,6 +2077,8 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
         # tools API not supported).
         _dump_tools_schema = None if use_text_tools else tools_json_schema
         _chat_model = cfg.llm_chat_model
+        if speech is not None:
+            speech.begin_turn()
         try:
             llm_resp = chat_with_messages(
                 cfg=cfg,
@@ -2059,6 +2087,8 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                 extra_options=None,
                 tools=_dump_tools_schema,
                 thinking=getattr(cfg, 'llm_thinking_enabled', False),
+                on_text=speech.feed if speech is not None else None,
+                cancel=cancel_event,
             )
             dump_reply_turn(
                 session_id=_dump_session_id,
@@ -2082,6 +2112,8 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             use_text_tools = True
             messages[0] = {"role": "system", "content": _build_initial_system_message()}
             _update_system_message_with_context(messages)
+            if speech is not None:
+                speech.begin_turn()
             llm_resp = chat_with_messages(
                 cfg=cfg,
                 messages=messages,
@@ -2089,6 +2121,8 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                 extra_options=None,
                 tools=None,
                 thinking=getattr(cfg, 'llm_thinking_enabled', False),
+                on_text=speech.feed if speech is not None else None,
+                cancel=cancel_event,
             )
             dump_reply_turn(
                 session_id=_dump_session_id,
@@ -2100,6 +2134,9 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                 use_text_tools=True,
                 response=llm_resp,
             )
+        if _cancelled():
+            debug_log("reply cancelled during generation", "planning")
+            return None
         if not llm_resp:
             debug_log("  ❌ LLM returned no response", "planning")
             break
@@ -2500,6 +2537,10 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
         last_candidate_reply = candidate_reply
         break
 
+    if _cancelled():
+        debug_log("reply cancelled after the loop", "planning")
+        return None
+
     # Step 9: Handle error case - return error message if no reply
     if not reply or not reply.strip():
         # Max-turn backstop: the loop exhausted its turns without producing
@@ -2541,6 +2582,8 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                 print(f"\n⚠️ Jarvis\n  {_indent_text(reply)}\n", flush=True)
         except Exception as e:
             debug_log(f"error reply formatting failed: {e}", "planning")
+        if speech is not None:
+            speech.finish(reply)
 
         # Still add to dialogue memory so context is preserved
         if dialogue_memory is not None:
@@ -2572,7 +2615,9 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             debug_log(f"reply formatting failed: {e}", "planning")
 
         # TTS output - callbacks handled by calling code
-        if tts is not None and tts.enabled:
+        if speech is not None:
+            speech.finish(safe_reply)
+        elif tts is not None and tts.enabled:
             tts.speak(safe_reply)
 
     # Step 11: Add to dialogue memory

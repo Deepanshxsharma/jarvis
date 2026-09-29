@@ -1029,3 +1029,40 @@ class TestOpenAICompatibleSanitizesMessages:
         assert sys_msg["role"] == "system"
         assert sys_msg["content"] == "You are a helpful assistant."
         assert "_is_context_injected" not in sys_msg
+
+
+class TestOpenAICompatibleChatTextCallback:
+    """``chat`` hands the whole content to ``on_text`` once and honours cancel."""
+
+    @patch("jarvis.llm.requests.post")
+    def test_content_is_delivered_once(self, mock_post):
+        from jarvis.llm import OpenAICompatibleBackend
+
+        mock_post.return_value = _make_response(
+            json_data={"choices": [{"message": {"role": "assistant", "content": "Hi there."}}]}
+        )
+        pieces = []
+        result = OpenAICompatibleBackend("http://localhost:1234/v1").chat(
+            "m", [{"role": "user", "content": "hi"}], on_text=pieces.append)
+
+        assert pieces == ["Hi there."]
+        assert result["message"]["content"] == "Hi there."
+
+    @patch("jarvis.llm.requests.post")
+    def test_cancelled_request_returns_nothing(self, mock_post):
+        import threading
+        from jarvis.llm import OpenAICompatibleBackend
+
+        cancel = threading.Event()
+
+        def post(*_a, **_k):
+            cancel.set()
+            return _make_response(json_data={"choices": [{"message": {"content": "late"}}]})
+
+        mock_post.side_effect = post
+        pieces = []
+        result = OpenAICompatibleBackend("http://localhost:1234/v1").chat(
+            "m", [{"role": "user", "content": "hi"}], on_text=pieces.append, cancel=cancel)
+
+        assert result is None
+        assert pieces == []

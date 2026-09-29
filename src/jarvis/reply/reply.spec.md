@@ -386,6 +386,15 @@ Every reply records how long each stage took (`src/jarvis/reply/timing.py`). `ru
 - `tokens` sums the chat model's `prompt_eval_count` and `eval_count` across the reply's `llm` turns, so prompt-size regressions show up in the field.
 - The record lives in a context variable, so replies on different threads never mix. `last_reply_timing()` returns the most recent record for benchmarks and tests.
 
+### Streamed Speech and Cancellation
+`run_reply_engine` takes two optional arguments for voice replies:
+
+- `on_speech(sentence)`: the whole spoken reply is delivered through this callback, one sentence at a time, and `tts` is not used. Chat-model turns stream their content (`chat_with_messages(..., on_text=...)`) into a `SpeechStreamer` (`src/jarvis/reply/speech_stream.py`), which hands each finished sentence to `on_speech` while the model is still writing.
+  - A turn whose content opens like structured output (`tool_calls`, a code fence, JSON, a tag) is held and never spoken. A tool-call marker appearing later in a prose turn stops speech at the marker; sentences finished before it (a preamble such as "Let me look that up.") have already been spoken.
+  - Sentences end at terminal punctuation (including the Devanagari danda and CJK stops) followed by whitespace. A digit before the stop does not end a sentence, so list markers and decimals stay attached.
+  - When the reply is decided, `finish(reply)` speaks what is left: only the unspoken tail when the reply is the turn that was streaming, or the whole reply when it came from elsewhere (error message, digest, malformed-output fallback, an answer after a tool call).
+- `cancel_event`: when set, the engine stops at the next checkpoint (before each turn, during a streaming chat call, and after the loop), closes any in-flight chat request so the model stops generating, and returns `None` without speaking or recording anything further.
+
 ### Logging and Privacy
 - Use `debug_log` for key steps: `memory`, `planning`, and `voice` categories.
 - Avoid excessive logging; logs must remain readable and privacy-preserving.

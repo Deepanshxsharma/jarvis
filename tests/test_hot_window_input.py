@@ -1764,7 +1764,7 @@ class TestReplyWorker:
         import threading
         calls = []
 
-        def fake_reply(db, cfg, _x, query, _memory, language=None):
+        def fake_reply(db, cfg, _x, query, _memory, language=None, **_kwargs):
             calls.append((query, language))
             return reply
 
@@ -1819,3 +1819,123 @@ def test_format_voice_timing_matches_documented_shape():
         "chat": 0.52, "tts_first_audio": 0.18, "total": 1.27,
     })
     assert line == "VOICE capture=42ms vad=19ms whisper=310ms intent=240ms chat=520ms tts_first_audio=180ms total=1.27s"
+
+
+class TestStreamedReplySpeech:
+    """Replies are spoken sentence by sentence while they are generated."""
+
+    def _stream_recorder(self, mock_tts):
+        streams = []
+
+        def speak_stream(completion_callback=None, duration_callback=None, first_audio_callback=None):
+            stream = MagicMock()
+            stream.added = []
+            stream.add.side_effect = stream.added.append
+            stream.callbacks = (completion_callback, duration_callback, first_audio_callback)
+            streams.append(stream)
+            return stream
+
+        mock_tts.speak_stream.side_effect = speak_stream
+        return streams
+
+    @patch("builtins.print")
+    def test_sentences_go_to_one_speech_stream_as_they_arrive(self, _print):
+        listener, mock_tts = _create_listener()
+        streams = self._stream_recorder(mock_tts)
+
+        def fake_reply(db, cfg, _x, query, _memory, language=None, on_speech=None, cancel_event=None):
+            on_speech("It is sunny.")
+            assert len(streams) == 1 and streams[0].added == ["It is sunny."]
+            on_speech("Take sunglasses.")
+            return "It is sunny. Take sunglasses."
+
+        with patch("jarvis.reply.engine.run_reply_engine", side_effect=fake_reply):
+            listener._dispatch_query("weather")
+
+        assert streams[0].added == ["It is sunny.", "Take sunglasses."]
+        streams[0].finish.assert_called_once()
+        streams[0].cancel.assert_not_called()
+        mock_tts.speak.assert_not_called()
+        assert listener.echo_detector._last_tts_text == "it is sunny. take sunglasses."
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_voice_timing_counts_chat_to_the_first_sentence(self, printed):
+        import time as _time
+        listener, mock_tts = _create_listener()
+        streams = self._stream_recorder(mock_tts)
+
+        def fake_reply(db, cfg, _x, query, _memory, language=None, on_speech=None, cancel_event=None):
+            on_speech("First.")
+            streams[0].callbacks[2]()
+            _time.sleep(0.3)
+            on_speech("Second.")
+            return "First. Second."
+
+        with patch("jarvis.reply.engine.run_reply_engine", side_effect=fake_reply):
+            listener._dispatch_query("hi", timing={"speech_end": _time.perf_counter()})
+
+        lines = [str(c.args[0]) for c in printed.call_args_list if c.args and "VOICE" in str(c.args[0])]
+        assert len(lines) == 1
+        chat_ms = int(lines[0].split("chat=")[1].split("ms")[0])
+        assert chat_ms < 250
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_stop_while_thinking_cancels_generation(self, _print):
+        listener, mock_tts = _create_listener()
+        streams = self._stream_recorder(mock_tts)
+        seen_cancel = []
+
+        def fake_reply(db, cfg, _x, query, _memory, language=None, on_speech=None, cancel_event=None):
+            listener._reply_busy.set()
+            listener._process_transcript("stop")
+            seen_cancel.append(cancel_event.is_set())
+            on_speech("Too late.")
+            return None
+
+        with patch("jarvis.reply.engine.run_reply_engine", side_effect=fake_reply):
+            listener._dispatch_query("tell me a story")
+
+        assert seen_cancel == [True]
+        assert streams == []
+        mock_tts.speak.assert_not_called()
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_cutting_in_during_streamed_speech_stops_generation(self, _print):
+        listener, mock_tts = _create_listener()
+        streams = self._stream_recorder(mock_tts)
+        seen_cancel = []
+
+        def fake_reply(db, cfg, _x, query, _memory, language=None, on_speech=None, cancel_event=None):
+            on_speech("Once upon a time.")
+            mock_tts.is_speaking.return_value = True
+            listener._process_transcript("stop")
+            seen_cancel.append(cancel_event.is_set())
+            return None
+
+        with patch("jarvis.reply.engine.run_reply_engine", side_effect=fake_reply):
+            listener._dispatch_query("tell me a story")
+
+        assert seen_cancel == [True]
+        mock_tts.interrupt.assert_called()
+        streams[0].cancel.assert_called_once()
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_tts_without_streaming_speaks_the_whole_reply(self, _print):
+        listener, mock_tts = _create_listener()
+        del mock_tts.speak_stream
+        received = {}
+
+        def fake_reply(db, cfg, _x, query, _memory, language=None, on_speech=None, cancel_event=None):
+            received["on_speech"] = on_speech
+            return "Hello there."
+
+        with patch("jarvis.reply.engine.run_reply_engine", side_effect=fake_reply):
+            listener._dispatch_query("hi")
+
+        assert received["on_speech"] is None
+        assert mock_tts.speak.call_args.args[0] == "Hello there."
+        listener.state_manager.stop()

@@ -13,11 +13,63 @@ import time
 import warnings
 from collections import deque
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Iterable, Iterator
 from urllib.parse import urlparse
 
 from ..debug import debug_log
 from ..utils.audio_lock import portaudio_lock
+
+
+class SpeechStream:
+    """Text handed to a TTS engine a piece at a time as a reply is generated.
+
+    The producer calls ``add`` for each sentence and ``finish`` once the
+    reply is complete. The engine speaks the pieces in order as one
+    utterance. ``cancel`` ends the stream early; pieces not yet spoken are
+    dropped.
+    """
+
+    def __init__(
+        self,
+        completion_callback: Optional[Callable[[], None]] = None,
+        duration_callback: Optional[Callable[[float], None]] = None,
+        first_audio_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.completion_callback = completion_callback
+        self.duration_callback = duration_callback
+        self.first_audio_callback = first_audio_callback
+        self._pieces: queue.Queue[Optional[str]] = queue.Queue()
+        self._cancelled = threading.Event()
+        self._finished = False
+
+    def add(self, text: str) -> None:
+        if self._finished or not text.strip():
+            return
+        self._pieces.put(_preprocess_for_speech(text))
+
+    def finish(self) -> None:
+        if not self._finished:
+            self._finished = True
+            self._pieces.put(None)
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        self.finish()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def pieces(self, should_stop: Callable[[], bool]) -> Iterator[str]:
+        """Yield pieces until the stream finishes, is cancelled or ``should_stop``."""
+        while not self._cancelled.is_set() and not should_stop():
+            try:
+                piece = self._pieces.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if piece is None or self._cancelled.is_set():
+                return
+            yield piece
 
 
 # ============================================================================
@@ -666,7 +718,7 @@ class PiperTTS:
         self.sentence_silence = sentence_silence
 
         # Threading and queue setup (same pattern as other TTS engines)
-        self._q: queue.Queue[str] = queue.Queue()
+        self._q: queue.Queue[str | SpeechStream] = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._is_speaking = threading.Event()
@@ -675,6 +727,8 @@ class PiperTTS:
         self._duration_callback: Optional[Callable[[float], None]] = None
         self._first_audio_callback: Optional[Callable[[], None]] = None
         self._should_interrupt = threading.Event()
+        self._streams: list[SpeechStream] = []
+        self._streams_lock = threading.Lock()
 
         # Piper voice (lazy loaded)
         self._voice = None
@@ -811,9 +865,32 @@ class PiperTTS:
         except Exception:
             pass
 
+    def speak_stream(self, completion_callback: Optional[Callable[[], None]] = None,
+                     duration_callback: Optional[Callable[[float], None]] = None,
+                     first_audio_callback: Optional[Callable[[], None]] = None) -> SpeechStream:
+        """Start an utterance whose text arrives piece by piece.
+
+        Speech begins as soon as the first piece is added. Callbacks behave
+        as for ``speak``; the duration covers the whole stream.
+        """
+        stream = SpeechStream(completion_callback, duration_callback, first_audio_callback)
+        if not self.enabled:
+            stream.cancel()
+            return stream
+        if self._thread is None:
+            self.start()
+        with self._streams_lock:
+            self._streams.append(stream)
+        self._q.put_nowait(stream)
+        return stream
+
     def interrupt(self) -> None:
-        """Stop current speech immediately."""
+        """Stop current speech immediately, including any open speech streams."""
         self._should_interrupt.set()
+        with self._streams_lock:
+            streams, self._streams = self._streams, []
+        for stream in streams:
+            stream.cancel()
         with self._audio_lock:
             if self._audio_stream is not None:
                 try:
@@ -825,20 +902,51 @@ class PiperTTS:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                text = self._q.get(timeout=0.5)
+                item = self._q.get(timeout=0.5)
             except queue.Empty:
                 continue
-            if not text:
+            if not item:
                 continue
             try:
-                self._speak_once(text)
+                if isinstance(item, SpeechStream):
+                    self._speak_stream_item(item)
+                else:
+                    self._speak_once(item)
             except Exception as e:
-                debug_log(f"Piper TTS error in _speak_once: {e}", "tts")
+                debug_log(f"Piper TTS error while speaking: {e}", "tts")
                 continue
 
+    def _speak_stream_item(self, stream: SpeechStream) -> None:
+        try:
+            if stream.cancelled:
+                return
+            on_complete = stream.completion_callback
+
+            def complete_unless_cancelled() -> None:
+                if on_complete is not None and not stream.cancelled:
+                    on_complete()
+
+            self._completion_callback = complete_unless_cancelled
+            self._duration_callback = stream.duration_callback
+            self._first_audio_callback = stream.first_audio_callback
+            self._speak_pieces(stream.pieces(self._stop.is_set))
+        finally:
+            with self._streams_lock:
+                if stream in self._streams:
+                    self._streams.remove(stream)
+
     def _speak_once(self, text: str) -> None:
+        self._speak_pieces(iter([text]))
+
+    def _speak_pieces(self, pieces: Iterable[str]) -> None:
+        """Speak each text piece in order through one continuous audio stream.
+
+        The stream stays open between pieces, playing silence while the next
+        one is awaited, so a reply that is still being generated sounds like
+        one utterance.
+        """
         self._is_speaking.set()
-        self._last_spoken_text = text
+        self._last_spoken_text = ""
         self._should_interrupt.clear()
         interrupted = False
 
@@ -856,8 +964,6 @@ class PiperTTS:
             import numpy as np
 
             start_time = time.time()
-
-            debug_log(f"Piper TTS starting synthesis: {len(text.split())} words", "tts")
 
             # Check for interruption before synthesis
             if self._should_interrupt.is_set():
@@ -909,34 +1015,44 @@ class PiperTTS:
                             raise sd.CallbackStop()
 
             total_samples = 0
-            for chunk in self._voice.synthesize(text, syn_config):
+            for text in pieces:
                 if self._should_interrupt.is_set():
-                    debug_log("Piper TTS interrupted during synthesis", "tts")
                     interrupted = True
                     break
-                samples = np.asarray(chunk.audio_int16_array, dtype=np.int16).reshape(-1)
-                if samples.size == 0:
+                if not text.strip():
                     continue
-                with pending_lock:
-                    pending.append(samples)
-                total_samples += samples.size
-                if self._audio_stream is None:
-                    with self._audio_lock:
-                        with portaudio_lock:
-                            self._audio_stream = sd.OutputStream(
-                                samplerate=self._sample_rate,
-                                channels=1,
-                                dtype='int16',
-                                blocksize=blocksize,
-                                callback=audio_callback,
-                            )
-                            self._audio_stream.start()
-                    debug_log(f"Piper TTS first audio after {time.time() - start_time:.2f}s", "tts")
-                    if self._first_audio_callback is not None:
-                        try:
-                            self._first_audio_callback()
-                        except Exception as e:
-                            debug_log(f"Piper TTS first-audio callback error: {e}", "tts")
+                debug_log(f"Piper TTS starting synthesis: {len(text.split())} words", "tts")
+                self._last_spoken_text = f"{self._last_spoken_text} {text}".strip()
+                for chunk in self._voice.synthesize(text, syn_config):
+                    if self._should_interrupt.is_set():
+                        debug_log("Piper TTS interrupted during synthesis", "tts")
+                        interrupted = True
+                        break
+                    samples = np.asarray(chunk.audio_int16_array, dtype=np.int16).reshape(-1)
+                    if samples.size == 0:
+                        continue
+                    with pending_lock:
+                        pending.append(samples)
+                    total_samples += samples.size
+                    if self._audio_stream is None:
+                        with self._audio_lock:
+                            with portaudio_lock:
+                                self._audio_stream = sd.OutputStream(
+                                    samplerate=self._sample_rate,
+                                    channels=1,
+                                    dtype='int16',
+                                    blocksize=blocksize,
+                                    callback=audio_callback,
+                                )
+                                self._audio_stream.start()
+                        debug_log(f"Piper TTS first audio after {time.time() - start_time:.2f}s", "tts")
+                        if self._first_audio_callback is not None:
+                            try:
+                                self._first_audio_callback()
+                            except Exception as e:
+                                debug_log(f"Piper TTS first-audio callback error: {e}", "tts")
+                if interrupted:
+                    break
             synthesis_done.set()
 
             if total_samples == 0 and not interrupted:

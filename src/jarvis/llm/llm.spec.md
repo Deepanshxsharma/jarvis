@@ -37,7 +37,7 @@ Two interchangeable styles dispatch to the same backend:
 |--------|---------|----------|
 | `direct(model, system, user, *, timeout_sec, thinking, temperature, max_tokens)` | `Optional[str]` | Single-shot system+user. Returns assistant text, or `None` on timeout / error / empty content. `max_tokens` caps generation length — essential for small reasoning models on classification tasks. |
 | `streaming(model, system, user, *, on_token, timeout_sec, thinking)` | `Optional[str]` | Streams tokens via `on_token`; returns the concatenated full text or `None` if no content was produced. |
-| `chat(model, messages, *, timeout_sec, extra_options, tools, thinking)` | `Optional[Dict]` | Arbitrary messages array. Returns the raw response dict so callers (today: the reply engine) can inspect `content` and `tool_calls`. Raises `ToolsNotSupportedError` when the model rejects native tools. Re-raises `requests.ConnectionError` so callers can distinguish "server unreachable" from a transient HTTP failure. |
+| `chat(model, messages, *, timeout_sec, extra_options, tools, thinking, on_text, cancel)` | `Optional[Dict]` | Arbitrary messages array. Returns the raw response dict so callers (today: the reply engine) can inspect `content` and `tool_calls`. `on_text(piece)` receives content pieces as they are generated and `cancel` (a `threading.Event`) abandons the request, returning `None`; see Streaming. Raises `ToolsNotSupportedError` when the model rejects native tools. Re-raises `requests.ConnectionError` so callers can distinguish "server unreachable" from a transient HTTP failure. |
 | `embed(text, model, *, timeout_sec)` | `Optional[List[float]]` | Vector embedding. Returns `None` on error or when the runtime does not expose embeddings. |
 | `list_models(*, timeout_sec)` | `List[str]` | Names of models the runtime has available. Returns `[]` on error. |
 | `warm_up(model, *, timeout_sec)` | `bool` | Pre-load probe before the first real request. The `LLMBackend` default returns `True` (no-op for runtimes without a useful probe). `OllamaBackend` verifies the server is Ollama via `GET /api/version`, then issues a minimal `/api/chat` completion with the backend's residency window and pinned context size to page the model into resident memory **and** trigger full inference-pipeline initialisation (JIT compilation, KV-cache allocation) — the chat-endpoint warmup prevents the timeout that an empty `/api/generate` ping would mask on the first real call. `OpenAICompatibleBackend` first runs a fast reachability check (`GET /models`, 25 % of budget, max 5 s), then sends a single-token chat completion (`max_tokens=1`) to force the runtime to load the model into memory. |
@@ -53,6 +53,11 @@ When a model rejects the `tools` parameter (Ollama returns HTTP 400 in that case
 ### Streaming
 
 Each backend parses its own stream format internally (Ollama JSONL, OpenAI SSE, Anthropic SSE event blocks). The public `on_token(str)` contract is identical across backends.
+
+`chat()` streams when `on_text` or `cancel` is given, and returns the same shape as a non-streamed call:
+
+- Ollama sends `stream: true` and assembles the JSONL events: content and thinking pieces are concatenated, tool calls collected, and the final event's counters (`prompt_eval_count`, `eval_count`, durations) kept. A watcher closes the HTTP response as soon as `cancel` is set; Ollama treats the closed connection as a cancelled task and stops generating. A failing `on_text` callback is logged and does not break the stream.
+- The OpenAI-compatible backend does not stream `chat()`: it delivers the whole content to `on_text` once, and returns `None` if `cancel` was set while the request ran.
 
 ### Embeddings
 

@@ -59,7 +59,19 @@ class EchoDetector:
 
         duration_info = f", exact_duration={exact_duration:.2f}s" if exact_duration else ""
         debug_log(f"TTS started, text_len={len(tts_text)}, baseline_energy={baseline_energy:.4f}{duration_info}", "echo")
-    
+
+    def extend_tts_text(self, more_text: str) -> None:
+        """Append text to the utterance being spoken, keeping its start time.
+
+        Used when a reply is spoken sentence by sentence while it is still
+        being generated.
+        """
+        more = more_text.lower().strip()
+        if not more:
+            return
+        self._last_tts_text = f"{self._last_tts_text} {more}".strip()
+        debug_log(f"TTS text extended, text_len={len(self._last_tts_text)}", "echo")
+
     def track_tts_finish(self) -> None:
         """Track when TTS finishes speaking."""
         self._last_tts_finish_time = time.time()

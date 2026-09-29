@@ -772,3 +772,110 @@ class TestPiperStreamingPlayback:
         self._speak(tts, "Short.", completion=lambda: completed.append(True))
         assert completed == [True]
         assert not tts.is_speaking()
+
+
+class TestPiperSpeechStream:
+    """Text added to a speech stream is spoken as one utterance, in order."""
+
+    def _tts(self):
+        import numpy as np
+        from src.jarvis.output.tts import PiperTTS
+        tts = PiperTTS(enabled=True)
+        tts._initialized = True
+        tts._voice = MagicMock()
+        tts._sample_rate = 16000
+        synthesised = []
+
+        def synthesize(text, _cfg):
+            synthesised.append(text)
+            yield _Chunk(np.full(800, len(synthesised), dtype=np.int16))
+
+        tts._voice.synthesize.side_effect = synthesize
+        return tts, synthesised
+
+    def _run(self, tts, drive):
+        import sys as _sys
+        sd = _fake_sounddevice()
+        with patch.dict(_sys.modules, {"sounddevice": sd}):
+            tts.start()
+            try:
+                drive()
+            finally:
+                tts.stop()
+        return sd
+
+    def test_pieces_added_over_time_play_in_order_with_one_completion(self):
+        import numpy as np
+        tts, synthesised = self._tts()
+        completed, first_audio, durations = [], [], []
+        done = threading.Event()
+
+        def drive():
+            stream = tts.speak_stream(
+                completion_callback=lambda: (completed.append(True), done.set()),
+                duration_callback=durations.append,
+                first_audio_callback=lambda: first_audio.append(time.monotonic()),
+            )
+            stream.add("First sentence.")
+            time.sleep(0.15)
+            assert tts.is_speaking()
+            stream.add("Second sentence.")
+            stream.finish()
+            assert done.wait(3)
+
+        sd = self._run(tts, drive)
+
+        assert synthesised == ["First sentence.", "Second sentence."]
+        assert completed == [True]
+        assert len(first_audio) == 1
+        assert durations == [1600 / 16000]
+        played = np.concatenate(sd.played).reshape(-1)
+        nonsilent = played[played != 0]
+        assert list(dict.fromkeys(nonsilent.tolist())) == [1, 2]
+        assert tts.get_last_spoken_text() == "First sentence. Second sentence."
+
+    def test_interrupt_cancels_the_stream_without_completion(self):
+        tts, synthesised = self._tts()
+        completed = []
+
+        def drive():
+            stream = tts.speak_stream(completion_callback=lambda: completed.append(True))
+            stream.add("First sentence.")
+            time.sleep(0.1)
+            tts.interrupt()
+            stream.add("Never spoken.")
+            stream.finish()
+            deadline = time.monotonic() + 2
+            while tts.is_speaking() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not tts.is_speaking()
+
+        self._run(tts, drive)
+
+        assert "Never spoken." not in synthesised
+        assert completed == []
+
+    def test_cancelled_stream_skips_completion(self):
+        tts, synthesised = self._tts()
+        completed = []
+
+        def drive():
+            stream = tts.speak_stream(completion_callback=lambda: completed.append(True))
+            stream.add("First sentence.")
+            time.sleep(0.1)
+            stream.cancel()
+            time.sleep(0.3)
+
+        self._run(tts, drive)
+
+        assert completed == []
+
+    def test_disabled_engine_returns_an_inert_stream(self):
+        from src.jarvis.output.tts import PiperTTS
+        tts = PiperTTS(enabled=False)
+        stream = tts.speak_stream()
+        stream.add("Hello.")
+        stream.finish()
+        assert stream.cancelled
+        assert tts._thread is None
+

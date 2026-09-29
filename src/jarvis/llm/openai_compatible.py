@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 import json
+import threading
 import requests
 
 from ..debug import debug_log
@@ -273,6 +274,25 @@ class OpenAICompatibleBackend(LLMBackend):
         extra_options: Optional[Dict[str, Any]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         thinking: bool = False,
+        on_text: Optional[Callable[[str], None]] = None,
+        cancel: Optional[threading.Event] = None,
+    ) -> Optional[Dict[str, Any]]:
+        result = self._chat_once(chat_model, messages, timeout_sec, extra_options, tools)
+        if cancel is not None and cancel.is_set():
+            return None
+        if result is not None and on_text is not None:
+            content = (result.get("message") or {}).get("content")
+            if isinstance(content, str) and content:
+                on_text(content)
+        return result
+
+    def _chat_once(
+        self,
+        chat_model: str,
+        messages: List[Dict[str, Any]],
+        timeout_sec: float,
+        extra_options: Optional[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
     ) -> Optional[Dict[str, Any]]:
         sanitised = strip_nonstandard_message_fields(messages)
         sanitised = self._encode_tool_call_arguments(sanitised)

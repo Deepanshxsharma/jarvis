@@ -457,6 +457,9 @@ class VoiceListener(threading.Thread):
         self._reply_thread: Optional[threading.Thread] = None
         self._reply_busy = threading.Event()
         self._reply_cancelled = threading.Event()
+        # Set to stop the reply currently being generated, e.g. when the user
+        # cuts in while its first sentences are already playing.
+        self._generation_cancel = threading.Event()
         self._tune_lock = threading.Lock()
         self._utterances_dropped = 0
         # Per-turn latency breakdown for the VOICE timing line.
@@ -579,6 +582,11 @@ class VoiceListener(threading.Thread):
 
             self.echo_detector.track_tts_start(tts_text, baseline_energy)
 
+    def _interrupt_speech(self) -> None:
+        """Stop playback and any reply still being generated for it."""
+        self._generation_cancel.set()
+        self.tts.interrupt()
+
     def activate_hot_window(self) -> None:
         """Activate hot window after TTS completion."""
         debug_log("TTS completed, checking hot window activation", "voice")
@@ -610,7 +618,7 @@ class VoiceListener(threading.Thread):
         self._wake_timestamp = None
         if self.tts and self.tts.enabled and self.tts.is_speaking():
             debug_log("barge-in: interrupting TTS for new query", "voice")
-            self.tts.interrupt()
+            self._interrupt_speech()
         self.state_manager.start_collection(query)
         self._start_thinking_tune()
         try:
@@ -649,6 +657,7 @@ class VoiceListener(threading.Thread):
                 self.state_manager.clear_collection()
             if self._reply_busy.is_set():
                 self._reply_cancelled.set()
+                self._generation_cancel.set()
             self._stop_thinking_tune()
             print("  🛑 Cancelled", flush=True)
             debug_log(f"stop command while thinking: {text_lower}", "voice")
@@ -756,7 +765,7 @@ class VoiceListener(threading.Thread):
             # Stop command detection (fast, text-based)
             if is_stop_command(text_lower, stop_commands, stop_fuzzy):
                 debug_log(f"stop command detected during TTS: {text_lower} (energy: {utterance_energy:.4f})", "voice")
-                self.tts.interrupt()
+                self._interrupt_speech()
                 return
 
             # Echo rejection during active TTS
@@ -791,7 +800,7 @@ class VoiceListener(threading.Thread):
                     and is_interrupt_command(text_lower, interrupt_commands)):
                 debug_log(f"barge-in interjection during TTS: '{text_lower}'", "voice")
                 print(f"  ✋ Interrupted: \"{text_lower}\"", flush=True)
-                self.tts.interrupt()
+                self._interrupt_speech()
                 self.activate_hot_window()
                 return
             barge_in = len(text_lower.split()) > 3
@@ -938,7 +947,7 @@ class VoiceListener(threading.Thread):
                 # If judge says stop command, interrupt TTS
                 if intent_judgment.stop and self.tts and self.tts.is_speaking():
                     debug_log(f"🛑 Intent judge detected stop command", "voice")
-                    self.tts.interrupt()
+                    self._interrupt_speech()
                     return
 
                 # If directed with query, process it
@@ -1299,54 +1308,100 @@ class VoiceListener(threading.Thread):
         # chat query cannot run the reply engine concurrently against the
         # same dialogue memory. Voice blocks while a text query finishes
         # rather than being dropped (see daemon.query_lock).
+        # TTS completion callback for hot window
+        def _on_tts_complete():
+            import time as _time
+            debug_log(f"TTS completion callback triggered at {_time.time():.3f}", "voice")
+            self.activate_hot_window()
+
+        # Duration callback to update echo detector with exact timing (Piper only)
+        def _on_duration_known(duration: float):
+            debug_log(f"TTS exact duration: {duration:.2f}s", "voice")
+            if self.echo_detector:
+                self.echo_detector._tts_exact_duration = duration
+
+        speak_start = [0.0]
+
+        def _on_first_audio():
+            now = _perf_counter()
+            timing["tts_first_audio"] = now - speak_start[0]
+            self._report_voice_timing(timing, now)
+
+        # With a TTS engine that accepts streamed text, each sentence is spoken
+        # as soon as the reply engine produces it, and "chat" in the timing
+        # line is the time to the first sentence rather than the whole reply.
+        can_stream = bool(self.tts and self.tts.enabled
+                          and callable(getattr(self.tts, "speak_stream", None)))
+        speech_stream = [None]
         chat_start = _perf_counter()
+
+        def _on_speech(sentence: str) -> None:
+            if self._generation_cancel.is_set() or self._reply_cancelled.is_set():
+                return
+            stream = speech_stream[0]
+            if stream is None:
+                now = _perf_counter()
+                timing["chat"] = now - chat_start
+                speak_start[0] = now
+                self._stop_thinking_tune()
+                self.track_tts_start(sentence)
+                debug_log("starting streamed TTS for reply", "voice")
+                stream = self.tts.speak_stream(
+                    completion_callback=_on_tts_complete,
+                    duration_callback=_on_duration_known,
+                    first_audio_callback=_on_first_audio,
+                )
+                speech_stream[0] = stream
+            else:
+                self.echo_detector.extend_tts_text(sentence)
+            stream.add(sentence)
+
+        self._generation_cancel.clear()
+        reply = None
         try:
             with query_lock():
                 reply = run_reply_engine(
                     self.db, self.cfg, None, query, self.dialogue_memory,
                     language=language,
+                    on_speech=_on_speech if can_stream else None,
+                    cancel_event=self._generation_cancel if can_stream else None,
                 )
         except Exception as e:
             # Log the error visibly - this should never happen silently
             print(f"\n  ❌ Reply engine error: {e}", flush=True)
             debug_log(f"reply engine exception: {e}", "voice")
             self._stop_thinking_tune()
+            if speech_stream[0] is not None:
+                speech_stream[0].cancel()
             # Provide user feedback via TTS
             if self.tts and self.tts.enabled:
                 self.tts.speak("Sorry, I encountered an error processing your request.")
             return
+        finally:
+            stream = speech_stream[0]
+            if stream is not None:
+                if reply and not self._generation_cancel.is_set():
+                    stream.finish()
+                else:
+                    stream.cancel()
 
-        timing["chat"] = _perf_counter() - chat_start
+        if "chat" not in timing:
+            timing["chat"] = _perf_counter() - chat_start
 
-        if self._reply_cancelled.is_set():
-            debug_log("reply discarded: cancelled by stop command", "voice")
+        if self._reply_cancelled.is_set() or self._generation_cancel.is_set():
+            debug_log("reply discarded: cancelled", "voice")
             self._reply_cancelled.clear()
             self._stop_thinking_tune()
+            return
+
+        if speech_stream[0] is not None:
             return
 
         # Handle TTS with proper callbacks
         if reply and self.tts and self.tts.enabled:
             # Stop thinking tune when TTS starts
             self._stop_thinking_tune()
-
-            # TTS completion callback for hot window
-            def _on_tts_complete():
-                import time as _time
-                debug_log(f"TTS completion callback triggered at {_time.time():.3f}", "voice")
-                self.activate_hot_window()
-
-            # Duration callback to update echo detector with exact timing (Piper only)
-            def _on_duration_known(duration: float):
-                debug_log(f"TTS exact duration: {duration:.2f}s", "voice")
-                if self.echo_detector:
-                    self.echo_detector._tts_exact_duration = duration
-
-            speak_start = _perf_counter()
-
-            def _on_first_audio():
-                now = _perf_counter()
-                timing["tts_first_audio"] = now - speak_start
-                self._report_voice_timing(timing, now)
+            speak_start[0] = _perf_counter()
 
             # Track TTS start for echo detection with actual text
             self.track_tts_start(reply)

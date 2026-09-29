@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
 
 import json
+import threading
 import requests
 
 from ..debug import debug_log
@@ -74,6 +75,75 @@ def extract_text_from_response(data: Dict[str, Any]) -> Optional[str]:
             return content
 
     return None
+
+
+def _read_chat_stream(
+    resp,
+    on_text: Optional[Callable[[str], None]],
+    cancel: Optional[threading.Event],
+) -> Optional[Dict[str, Any]]:
+    """Assemble a streamed ``/api/chat`` reply into the non-streamed shape.
+
+    Returns ``None`` when ``cancel`` is set before the reply completes.
+    """
+    finished = threading.Event()
+
+    def _close_on_cancel() -> None:
+        while not finished.wait(0.05):
+            if cancel.is_set():
+                resp.close()
+                return
+
+    if cancel is not None:
+        threading.Thread(target=_close_on_cancel, daemon=True, name="chat-cancel").start()
+
+    content: List[str] = []
+    thinking: List[str] = []
+    tool_calls: List[Any] = []
+    final: Dict[str, Any] = {}
+    try:
+        for line in resp.iter_lines():
+            if cancel is not None and cancel.is_set():
+                return None
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = data.get("message") or {}
+            piece = message.get("content") or ""
+            if piece:
+                content.append(piece)
+                if on_text is not None:
+                    try:
+                        on_text(piece)
+                    except Exception as exc:
+                        debug_log(f"chat stream text callback failed: {exc}", "llm")
+            if message.get("thinking"):
+                thinking.append(message["thinking"])
+            if message.get("tool_calls"):
+                tool_calls.extend(message["tool_calls"])
+            if data.get("done"):
+                final = data
+                break
+    except Exception:
+        if cancel is not None and cancel.is_set():
+            return None
+        raise
+    finally:
+        finished.set()
+
+    if cancel is not None and cancel.is_set():
+        return None
+    assembled: Dict[str, Any] = {"role": "assistant", "content": "".join(content)}
+    if thinking:
+        assembled["thinking"] = "".join(thinking)
+    if tool_calls:
+        assembled["tool_calls"] = tool_calls
+    result = dict(final)
+    result["message"] = assembled
+    return result
 
 
 OLLAMA_NUM_CTX = 8192
@@ -235,10 +305,17 @@ class OllamaBackend(LLMBackend):
         extra_options: Optional[Dict[str, Any]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         thinking: bool = False,
+        on_text: Optional[Callable[[str], None]] = None,
+        cancel: Optional[threading.Event] = None,
     ) -> Optional[Dict[str, Any]]:
         """Send an arbitrary messages array to Ollama and return the
         raw response JSON. Caller is responsible for interpreting
         assistant content (including JSON / tool calls).
+
+        With ``on_text`` or ``cancel`` the request streams: content
+        pieces reach ``on_text`` as they are generated, and setting
+        ``cancel`` closes the connection, which stops Ollama generating.
+        The returned dict has the same shape as a non-streamed reply.
 
         The pinned ``num_ctx`` (8192) keeps the system prompt (tool list +
         protocol guidance + memory context) from overflowing and forcing
@@ -277,11 +354,16 @@ class OllamaBackend(LLMBackend):
         if tools and isinstance(tools, list) and len(tools) > 0:
             payload["tools"] = tools
 
+        streamed = on_text is not None or cancel is not None
+        payload["stream"] = streamed
         try:
             with requests.post(
-                f"{self._base_url}/api/chat", json=payload, timeout=timeout_sec
+                f"{self._base_url}/api/chat", json=payload, timeout=timeout_sec,
+                stream=streamed,
             ) as resp:
                 resp.raise_for_status()
+                if streamed:
+                    return _read_chat_stream(resp, on_text, cancel)
                 data = resp.json()
             if isinstance(data, dict):
                 return data

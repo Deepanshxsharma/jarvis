@@ -1081,3 +1081,78 @@ class TestOllamaBackendSanitizesMessages:
         assert sys_msg["role"] == "system"
         assert sys_msg["content"] == "You are a helpful assistant."
         assert "_is_context_injected" not in sys_msg
+
+
+class TestOllamaBackendChatStreaming:
+    """Chat content can be delivered piece by piece and cancelled midway."""
+
+    @staticmethod
+    def _lines(*events):
+        return [json.dumps(e).encode() for e in events]
+
+    @patch("jarvis.llm.requests.post")
+    def test_pieces_reach_the_callback_and_assemble_into_the_usual_reply(self, mock_post):
+        from jarvis.llm import OllamaBackend
+
+        mock_post.return_value = _make_response(iter_lines=self._lines(
+            {"message": {"role": "assistant", "content": "Hello"}, "done": False},
+            {"message": {"role": "assistant", "content": " there."}, "done": False},
+            {"message": {"role": "assistant", "content": ""}, "done": True,
+             "prompt_eval_count": 42, "eval_count": 3},
+        ))
+        pieces = []
+
+        result = OllamaBackend("http://localhost:11434").chat(
+            "gemma4:e2b", [{"role": "user", "content": "Hi"}], on_text=pieces.append)
+
+        assert pieces == ["Hello", " there."]
+        assert result["message"] == {"role": "assistant", "content": "Hello there."}
+        assert result["prompt_eval_count"] == 42
+        assert mock_post.call_args.kwargs["json"]["stream"] is True
+
+    @patch("jarvis.llm.requests.post")
+    def test_streamed_tool_calls_are_kept(self, mock_post):
+        from jarvis.llm import OllamaBackend
+
+        call = {"function": {"name": "getWeather", "arguments": {"city": "Delhi"}}}
+        mock_post.return_value = _make_response(iter_lines=self._lines(
+            {"message": {"role": "assistant", "content": "", "tool_calls": [call]}, "done": False},
+            {"message": {"role": "assistant", "content": ""}, "done": True},
+        ))
+
+        result = OllamaBackend("http://localhost:11434").chat(
+            "gemma4:e2b", [{"role": "user", "content": "weather"}], on_text=lambda _p: None)
+
+        assert result["message"]["tool_calls"] == [call]
+
+    @patch("jarvis.llm.requests.post")
+    def test_cancelling_midway_returns_nothing(self, mock_post):
+        import threading
+        from jarvis.llm import OllamaBackend
+
+        cancel = threading.Event()
+        pieces = []
+
+        def lines():
+            yield json.dumps({"message": {"content": "One."}, "done": False}).encode()
+            cancel.set()
+            yield json.dumps({"message": {"content": " Two."}, "done": False}).encode()
+            yield json.dumps({"message": {"content": ""}, "done": True}).encode()
+
+        mock_post.return_value = _make_response(iter_lines=lines())
+
+        result = OllamaBackend("http://localhost:11434").chat(
+            "gemma4:e2b", [{"role": "user", "content": "Hi"}],
+            on_text=pieces.append, cancel=cancel)
+
+        assert result is None
+        assert pieces == ["One."]
+
+    @patch("jarvis.llm.requests.post")
+    def test_without_callbacks_the_reply_is_not_streamed(self, mock_post):
+        from jarvis.llm import OllamaBackend
+
+        mock_post.return_value = _make_response(json_data={"message": {"content": "hi"}})
+        OllamaBackend("http://localhost:11434").chat("gemma4:e2b", [{"role": "user", "content": "Hi"}])
+
+        assert mock_post.call_args.kwargs["json"]["stream"] is False

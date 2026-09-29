@@ -212,7 +212,9 @@ While TTS is playing, echo rejection and stop commands are handled with fast tex
 - Three words or fewer containing a phrase from `interrupt_commands` as whole words (default "wait", "hold on", "hang on", "actually") interrupts playback and opens the hot window, so the follow-up ("actually, wait... make it Friday") needs no wake word. Other short speech ("uh huh") is ignored.
 - Longer non-echo speech is judged as a hot-window follow-up; if accepted, playback is interrupted before the new query is collected.
 
-**Cancelling a pending reply:** A stop command of three words or fewer while a query is being collected or the reply engine is still working cancels it: the collected query is dropped, or the finished reply is discarded instead of spoken (`🛑 Cancelled`). Longer speech never cancels, because a stop word inside a sentence is usually not a command ("when does the last bus stop").
+**Cancelling a pending reply:** A stop command of three words or fewer while a query is being collected or the reply engine is still working cancels it: the collected query is dropped, or generation stops and nothing more is spoken (`🛑 Cancelled`). Longer speech never cancels, because a stop word inside a sentence is usually not a command ("when does the last bus stop").
+
+**Stopping generation with playback:** Every interruption of playback (stop command, interjection, accepted barge-in) also cancels the reply that is being generated for it, so a streamed reply whose first sentences are already playing stops generating instead of speaking the rest later.
 
 **Echo handling:**
 - Transcripts during TTS are flagged with `is_during_tts=true`
@@ -393,7 +395,9 @@ Three threads keep capture independent of the models:
 ⏱️  VOICE capture=42ms vad=19ms whisper=310ms intent=240ms collect=610ms chat=520ms tts_first_audio=180ms total=1.92s
 ```
 
-`capture` is the wait between the VAD endpoint and Whisper starting, `vad` the VAD compute for the utterance, `intent` the time from transcript to acceptance, `collect` the collection window, `chat` the reply engine, and `tts_first_audio` the time from `speak()` to the first audio block. `total` runs from the VAD endpoint of the user's last utterance to the first audio (or to the reply being ready when TTS is off).
+`capture` is the wait between the VAD endpoint and Whisper starting, `vad` the VAD compute for the utterance, `intent` the time from transcript to acceptance, `collect` the collection window, `chat` the reply engine up to the first speakable sentence (the whole reply when speech is not streamed), and `tts_first_audio` the time from handing that text to TTS to the first audio block. `total` runs from the VAD endpoint of the user's last utterance to the first audio (or to the reply being ready when TTS is off).
+
+**Streamed reply speech:** When the TTS engine offers `speak_stream()` (Piper), the reply worker passes `on_speech` and a cancel event to the reply engine. The first sentence stops the thinking tune, starts a speech stream and starts echo tracking; later sentences are added to the same stream and appended to the echo detector's tracked text (`extend_tts_text`), so playback is one utterance that begins while the rest of the reply is still being generated. The stream is finished when the engine returns a reply and cancelled when it returns none or raises. The hot window opens when the stream has played to the end. TTS engines without `speak_stream()` get the whole reply through `speak()` as before.
 
 ```
 Microphone Audio
