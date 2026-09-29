@@ -584,30 +584,6 @@ class TestOpenAICompatibleWarmUp:
 
     @patch("jarvis.llm.requests.post")
     @patch("jarvis.llm.requests.get")
-    def test_warmup_accepts_keep_alive_kwarg_and_ignores_it(self, mock_get, mock_post):
-        """The shared ``warm_up_chat_model`` helper always passes
-        ``keep_alive`` (Ollama parity). The OpenAI-compatible backend must
-        accept the kwarg; before the fix it raised ``TypeError`` and every
-        warmup silently failed."""
-        from jarvis.llm import OpenAICompatibleBackend
-
-        get_resp = MagicMock()
-        get_resp.json.return_value = {"data": [{"id": "gpt-4o-mini"}]}
-        get_resp.raise_for_status = MagicMock()
-        mock_get.return_value = get_resp
-
-        post_resp = MagicMock()
-        post_resp.__enter__.return_value.ok = True
-        mock_post.return_value = post_resp
-
-        backend = OpenAICompatibleBackend("http://localhost:1234/v1")
-        assert backend.warm_up("gpt-4o-mini", keep_alive="1m") is True
-
-        _, kwargs = mock_post.call_args
-        assert "keep_alive" not in kwargs["json"]
-
-    @patch("jarvis.llm.requests.post")
-    @patch("jarvis.llm.requests.get")
     def test_warm_up_chat_model_helper_works_on_openai_compatible(
         self, mock_get, mock_post
     ):

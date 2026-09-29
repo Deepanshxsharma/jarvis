@@ -211,8 +211,8 @@ The engine consumes the plan in two phases.
   free-form by design).
 - Tolerates markdown fences the model may add despite instructions.
 - Both planner LLM calls (`plan_query` and `resolve_next_tool_call`)
-  request `num_ctx=8192` from Ollama so enriched memory and tool
-  catalogue don't silently truncate in the 4096-token default window.
+  run in the Ollama backend's pinned 8192-token context window, so
+  enriched memory and tool catalogue don't silently truncate.
 
 ## Fail-open invariants
 

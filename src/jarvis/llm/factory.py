@@ -16,13 +16,25 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .backend import LLMBackend
-from .ollama import OllamaBackend
+from .ollama import DEFAULT_OLLAMA_KEEP_ALIVE, OllamaBackend
 from .openai_compatible import OpenAICompatibleBackend
 
 
 _OLLAMA = "ollama"
 _OPENAI_COMPATIBLE = "openai_compatible"
 _DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+LOW_POWER_OLLAMA_KEEP_ALIVE = "1m"
+
+
+def ollama_keep_alive(settings: Any) -> str:
+    """Model residency for the active power mode.
+
+    Voice sessions have long quiet stretches, so models stay resident for
+    half an hour by default; low power mode releases memory after a minute.
+    """
+    if getattr(settings, "low_power_mode", False) is True:
+        return LOW_POWER_OLLAMA_KEEP_ALIVE
+    return DEFAULT_OLLAMA_KEEP_ALIVE
 
 
 def _resolve_provider(value: Any) -> str:
@@ -38,10 +50,10 @@ def _str_attr(settings: Any, name: str, default: str = "") -> str:
     return val if isinstance(val, str) and val else default
 
 
-def _build(provider: str, base_url: str, api_key: Optional[str]) -> LLMBackend:
+def _build(provider: str, base_url: str, api_key: Optional[str], settings: Any) -> LLMBackend:
     if provider == _OPENAI_COMPATIBLE:
         return OpenAICompatibleBackend(base_url, api_key=api_key)
-    return OllamaBackend(base_url)
+    return OllamaBackend(base_url, keep_alive=ollama_keep_alive(settings))
 
 
 def get_llm_backend(settings: Any) -> LLMBackend:
@@ -60,7 +72,7 @@ def get_llm_backend(settings: Any) -> LLMBackend:
     else:
         base_url = _str_attr(settings, "ollama_base_url", _DEFAULT_OLLAMA_URL)
     api_key = _str_attr(settings, "llm_api_key") or None
-    return _build(provider, base_url, api_key)
+    return _build(provider, base_url, api_key, settings)
 
 
 def get_embedding_backend(settings: Any) -> LLMBackend:
@@ -89,4 +101,4 @@ def get_embedding_backend(settings: Any) -> LLMBackend:
     api_key = _str_attr(settings, "embedding_api_key") or _str_attr(
         settings, "llm_api_key"
     ) or None
-    return _build(provider, base_url, api_key)
+    return _build(provider, base_url, api_key, settings)

@@ -276,12 +276,11 @@ class TestIntentJudge:
         assert result.directed is True
         assert result.query == "what time is it"
 
-    def test_judge_uses_short_keep_alive_in_low_power_mode(self):
-        """Low-power mode keeps Ollama's judge residency brief."""
-        from types import SimpleNamespace
-
-        cfg = SimpleNamespace(low_power_mode=True)
-        judge = IntentJudge(IntentJudgeConfig(cfg=cfg))
+    def test_judge_leaves_context_and_residency_to_the_backend(self):
+        """The backend pins ``num_ctx`` and ``keep_alive`` for every request;
+        the judge only sends sampling options so its requests reuse the same
+        loaded runner as the rest of Jarvis."""
+        judge = IntentJudge()
         backend = MagicMock()
         backend.chat.return_value = {
             "message": {
@@ -294,27 +293,8 @@ class TestIntentJudge:
             judge.judge(segments)
 
         extra_options = backend.chat.call_args.kwargs["extra_options"]
-        assert extra_options["keep_alive"] == "1m"
-
-    def test_judge_keeps_default_residency_when_low_power_mode_is_off(self):
-        """Default mode keeps the judge model resident between voice turns."""
-        from types import SimpleNamespace
-
-        cfg = SimpleNamespace(low_power_mode=False)
-        judge = IntentJudge(IntentJudgeConfig(cfg=cfg))
-        backend = MagicMock()
-        backend.chat.return_value = {
-            "message": {
-                "content": '{"directed": true, "query": "time", "stop": false, "confidence": "high", "reasoning": "ok"}'
-            }
-        }
-        segments = [TranscriptSegment("jarvis time", 1000.0, 1001.0)]
-
-        with patch("jarvis.listening.intent_judge.get_llm_backend", return_value=backend):
-            judge.judge(segments)
-
-        extra_options = backend.chat.call_args.kwargs["extra_options"]
-        assert extra_options["keep_alive"] == "30m"
+        assert "keep_alive" not in extra_options
+        assert "num_ctx" not in extra_options
 
     def test_judge_handles_api_error(self):
         """judge() handles API errors gracefully."""
@@ -578,22 +558,6 @@ class TestWarmUp:
         args, kwargs = backend.warm_up.call_args
         assert args[0] == "gemma4:e2b"
         assert kwargs.get("timeout_sec") and kwargs["timeout_sec"] >= 60.0
-        assert kwargs["keep_alive"] == "30m"
-
-    def test_warmup_uses_short_keep_alive_in_low_power_mode(self):
-        """Low-power warmup requests brief model residency."""
-        from types import SimpleNamespace
-
-        cfg = SimpleNamespace(llm_provider="ollama", llm_base_url="http://x", low_power_mode=True)
-        judge = IntentJudge(IntentJudgeConfig(model="gemma4:e2b", cfg=cfg))
-        backend = MagicMock()
-        backend.warm_up.return_value = True
-        with patch(
-            "jarvis.listening.intent_judge.get_llm_backend", return_value=backend
-        ):
-            assert judge.warm_up() is True
-
-        assert backend.warm_up.call_args.kwargs["keep_alive"] == "1m"
 
     def test_warmup_returns_false_when_backend_fails(self):
         """Backend returning False propagates as a failed warmup."""

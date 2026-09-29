@@ -91,7 +91,6 @@ class LLMBackend(ABC):
         user_content: str,
         timeout_sec: float = 10.0,
         thinking: bool = False,
-        num_ctx: int = 4096,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> Optional[str]:
@@ -152,12 +151,11 @@ class LLMBackend(ABC):
         self,
         model: str,
         timeout_sec: float = 60.0,
-        keep_alive: str = "30m",
     ) -> bool:
         """Page ``model`` into the runtime's resident memory ahead of the
         first real request. Default implementation is a no-op suitable for
         runtimes without per-call model unloading (OpenAI-compatible servers
         keep models warm at server load time). Backends that benefit from
-        explicit warmup (e.g. Ollama, which unloads after ``keep_alive``)
-        override to perform the runtime-specific ping."""
+        explicit warmup (e.g. Ollama, which unloads after its residency
+        window) override to perform the runtime-specific ping."""
         return True

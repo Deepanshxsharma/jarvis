@@ -59,7 +59,6 @@ def call_llm_direct(
     user_content: str,
     timeout_sec: float = 10.0,
     thinking: bool = False,
-    num_ctx: int = 4096,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
 ) -> Optional[str]:
@@ -73,7 +72,6 @@ def call_llm_direct(
         user_content,
         timeout_sec=timeout_sec,
         thinking=thinking,
-        num_ctx=num_ctx,
         temperature=temperature,
         max_tokens=max_tokens,
     )

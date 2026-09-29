@@ -124,15 +124,12 @@ class OpenAICompatibleBackend(LLMBackend):
         user_content: str,
         timeout_sec: float = 10.0,
         thinking: bool = False,
-        num_ctx: int = 4096,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> Optional[str]:
-        # ``num_ctx`` and ``thinking`` have no equivalent in the OpenAI
-        # shape; servers that need a fixed context window configure it
-        # at load time, and reasoning is a model attribute rather than
-        # a request flag. Both are accepted for signature parity with
-        # OllamaBackend and silently ignored here.
+        # ``thinking`` has no equivalent in the OpenAI shape; reasoning is
+        # a model attribute rather than a request flag. It is accepted for
+        # signature parity with OllamaBackend and silently ignored here.
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -400,7 +397,6 @@ class OpenAICompatibleBackend(LLMBackend):
         self,
         model: str,
         timeout_sec: float = 60.0,
-        keep_alive: str = "30m",
     ) -> bool:
         """Warm up the model by sending a minimal inference request.
 
@@ -414,11 +410,6 @@ class OpenAICompatibleBackend(LLMBackend):
         model cold until the first real request, incurring latency on the
         user's first query. This mirrors what ``OllamaBackend.warm_up()``
         does.
-
-        ``keep_alive`` is accepted for signature parity with
-        ``OllamaBackend.warm_up`` but ignored: OpenAI-compatible servers
-        manage model residency at server load time and have no per-call
-        keep-alive knob.
 
         Best-effort: errors are swallowed; ``False`` is returned when the
         server is unreachable, the model name is missing, or the inference

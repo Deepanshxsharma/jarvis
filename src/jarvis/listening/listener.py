@@ -26,7 +26,6 @@ from .wake_detection import is_wake_word_detected, extract_query_after_wake, is_
 from .transcript_buffer import TranscriptBuffer
 from .intent_judge import (
     IntentJudge,
-    _is_low_power_mode_enabled,
     create_intent_judge,
     warm_up_chat_model,
 )
@@ -1655,7 +1654,7 @@ class VoiceListener(threading.Thread):
         """
         self._llm_warmup_results: dict[str, tuple[str, bool]] = {}
 
-        if _is_low_power_mode_enabled(self.cfg):
+        if getattr(self.cfg, "low_power_mode", False) is True:
             print("     🌱 Low power mode: LLM warmup skipped", flush=True)
             debug_log("low power mode enabled: skipping LLM warmup", "voice")
             return []

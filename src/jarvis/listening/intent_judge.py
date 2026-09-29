@@ -17,42 +17,21 @@ from ..llm import get_llm_backend, resolve_model, Tier
 from .transcript_buffer import TranscriptSegment
 
 
-DEFAULT_OLLAMA_KEEP_ALIVE = "30m"
-LOW_POWER_OLLAMA_KEEP_ALIVE = "1m"
-
-
-def _is_low_power_mode_enabled(cfg: Any) -> bool:
-    """Return True only when Settings.low_power_mode is explicitly enabled."""
-    if cfg is None:
-        return False
-    return getattr(cfg, "low_power_mode", False) is True
-
-
-def _ollama_keep_alive_for_power_mode(cfg: Any) -> str:
-    """Return the Ollama residency duration for the active power mode."""
-    if _is_low_power_mode_enabled(cfg):
-        return LOW_POWER_OLLAMA_KEEP_ALIVE
-    return DEFAULT_OLLAMA_KEEP_ALIVE
-
-
 def warm_up_chat_model(cfg, model: str, timeout: float) -> bool:
     """Page ``model`` into the active backend's resident memory.
 
     Thin wrapper over :meth:`LLMBackend.warm_up` so callers don't need to
     construct a backend just to ask for a warmup. Returns whatever the
     backend's warmup result is — on an Ollama backend this sends a real
-    inference with ``keep_alive``; on an OpenAI-compatible backend it
-    also sends a minimal inference to force model loading (no longer a
-    no-op). A failed warmup is informational and never blocks operation.
+    inference with the backend's residency window; on an
+    OpenAI-compatible backend it also sends a minimal inference to force
+    model loading. A failed warmup is informational and never blocks
+    operation.
     """
     if not model:
         return False
     try:
-        ok = get_llm_backend(cfg).warm_up(
-            model,
-            timeout_sec=timeout,
-            keep_alive=_ollama_keep_alive_for_power_mode(cfg),
-        )
+        ok = get_llm_backend(cfg).warm_up(model, timeout_sec=timeout)
     except Exception as e:
         debug_log(f"warmup error (model={model}): {e}", "voice")
         return False
@@ -436,13 +415,11 @@ Examples:
             transcript_preview = "; ".join(s.text[:30] for s in segments[-3:])
             debug_log(f"🧠 Intent judge [{mode}]: \"{transcript_preview}...\"", "voice")
 
-            # Voice sessions can have long quiet stretches; the Ollama
-            # ``keep_alive`` keeps the judge model resident between
-            # engagements so we don't pay the cold-reload tax on each one.
-            # ``num_ctx: 8192`` covers a ~2k-token system prompt plus up to
-            # ~2 minutes of multi-speaker transcript without truncating the
-            # prompt tail. Both knobs are silently dropped on backends
-            # without an unloading concept (OpenAI-compatible servers).
+            # The backend's pinned context window (8192 on Ollama) covers a
+            # ~2k-token system prompt plus up to ~2 minutes of multi-speaker
+            # transcript without truncating the prompt tail, and its
+            # residency window keeps the judge model loaded between
+            # engagements.
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -465,10 +442,6 @@ Examples:
                         # still bounds slow or runaway generations; the
                         # model normally stops long before the cap.
                         "max_tokens": 1500,
-                        "num_ctx": 8192,
-                        "keep_alive": _ollama_keep_alive_for_power_mode(
-                            self.config.cfg
-                        ),
                     },
                     thinking=self.config.thinking,
                 )

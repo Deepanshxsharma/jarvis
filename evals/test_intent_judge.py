@@ -10,7 +10,13 @@ from unittest.mock import patch, MagicMock
 from dataclasses import dataclass
 from typing import Optional, List, Union
 
+import os
+
 from helpers import JUDGE_MODEL, JUDGE_BASE_URL, is_judge_llm_available
+
+# The intent judge runs on the fast tier. Defaults to the shipped fast model;
+# set EVAL_INTENT_JUDGE_MODEL to evaluate a candidate fast model.
+INTENT_JUDGE_MODEL = os.environ.get("EVAL_INTENT_JUDGE_MODEL", "gemma4:e2b")
 
 
 # =============================================================================
@@ -664,7 +670,7 @@ def run_intent_judge(case: IntentJudgeTestCase):
 
     judge = IntentJudge(IntentJudgeConfig(
         assistant_name="Jarvis",
-        model="gemma4:e2b",
+        model=INTENT_JUDGE_MODEL,
         timeout_sec=10.0,
     ))
 
@@ -690,7 +696,7 @@ def run_intent_judge_multi_segment(case: "MultiSegmentTestCase"):
     judge = IntentJudge(IntentJudgeConfig(
         assistant_name="Jarvis",
         aliases=list(case.aliases or []),
-        model="gemma4:e2b",
+        model=INTENT_JUDGE_MODEL,
         timeout_sec=10.0,
     ))
 
@@ -731,16 +737,17 @@ def is_intent_judge_available() -> bool:
             return False
         data = resp.json()
         models = [m.get("name", "") for m in data.get("models", [])]
-        return any("gemma4" in m for m in models)
+        return any(m == INTENT_JUDGE_MODEL or m.split(":")[0] == INTENT_JUDGE_MODEL for m in models)
     except Exception:
         return False
 
 
 def _skip_if_not_intent_judge_phase():
-    """Intent judge tests are fixed to gemma4:e2b and would run twice under the
-    multi-model eval matrix. Skip during the large-model phase to keep runtime
-    down; they still run once during the small-model (gemma4) phase."""
-    if "gemma4" not in JUDGE_MODEL:
+    """Intent judge tests are fixed to the fast model and would run twice under
+    the multi-model eval matrix. Skip during the large-model phase to keep
+    runtime down; they still run once during the small-model (gemma4) phase,
+    or whenever a candidate fast model is selected explicitly."""
+    if "gemma4" not in JUDGE_MODEL and "EVAL_INTENT_JUDGE_MODEL" not in os.environ:
         pytest.skip(f"Intent judge tests only run in the gemma4 phase (current: {JUDGE_MODEL})")
 
 
@@ -755,7 +762,7 @@ class TestIntentJudgeAccuracy:
     def test_intent_judge_case(self, case: IntentJudgeTestCase):
         _skip_if_not_intent_judge_phase()
         if not is_intent_judge_available():
-            pytest.skip("Intent judge model (gemma4) not available")
+            pytest.skip(f"Intent judge model ({INTENT_JUDGE_MODEL}) not available")
 
         if case.name in KNOWN_FAILING_CASES:
             pytest.xfail(f"Known issue: {case.name} needs prompt improvement")
@@ -849,8 +856,10 @@ class TestIntentJudgeFallback:
     def test_returns_none_when_ollama_unavailable(self):
         from jarvis.listening.intent_judge import IntentJudge, IntentJudgeConfig
 
+        from types import SimpleNamespace
+
         judge = IntentJudge(IntentJudgeConfig(
-            ollama_base_url="http://127.0.0.1:99999",
+            cfg=SimpleNamespace(llm_provider="ollama", ollama_base_url="http://127.0.0.1:9"),
             timeout_sec=1.0,
         ))
 
@@ -867,7 +876,7 @@ class TestIntentJudgeMultiSegment:
     def test_multi_segment_case(self, case: MultiSegmentTestCase):
         _skip_if_not_intent_judge_phase()
         if not is_intent_judge_available():
-            pytest.skip("Intent judge model (gemma4) not available")
+            pytest.skip(f"Intent judge model ({INTENT_JUDGE_MODEL}) not available")
 
         if case.name in KNOWN_FAILING_CASES:
             pytest.xfail(f"Known issue: {case.name} needs prompt improvement")
@@ -918,7 +927,7 @@ class TestProcessedSegmentFiltering:
     def test_processed_segment_not_reextracted(self):
         _skip_if_not_intent_judge_phase()
         if not is_intent_judge_available():
-            pytest.skip("Intent judge model (gemma4) not available")
+            pytest.skip(f"Intent judge model ({INTENT_JUDGE_MODEL}) not available")
 
         from jarvis.listening.intent_judge import IntentJudge, IntentJudgeConfig
 

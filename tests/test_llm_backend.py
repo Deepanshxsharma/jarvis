@@ -181,7 +181,7 @@ class TestOllamaBackendChat:
         )
         sent = mock_post.call_args.kwargs["json"]
         assert sent["options"]["num_predict"] == 300
-        assert sent["options"]["num_ctx"] == 4096
+        assert sent["options"]["num_ctx"] == 8192
         assert "max_tokens" not in sent["options"]
 
     @patch("jarvis.llm.requests.post")
@@ -264,9 +264,10 @@ class TestOllamaBackendChat:
         )
 
         sent = mock_post.call_args.kwargs["json"]
-        # caller-supplied options merge over the default; both keys present
+        # sampling options merge in; the context window stays pinned so
+        # Ollama never reloads the runner for a different num_ctx
         assert sent["options"]["temperature"] == 0.5
-        assert sent["options"]["num_ctx"] == 16384
+        assert sent["options"]["num_ctx"] == 8192
 
     @patch("jarvis.llm.requests.post")
     def test_extra_options_none_keeps_defaults(self, mock_post):
@@ -344,16 +345,91 @@ class TestOllamaBackendWarmUp:
         assert sent["keep_alive"] == "30m"
 
     @patch("jarvis.llm.requests.post")
-    def test_warmup_uses_caller_keep_alive(self, mock_post):
+    def test_warmup_uses_backend_keep_alive(self, mock_post):
+        from jarvis.llm import OllamaBackend
+
+        mock_post.return_value = MagicMock(status_code=200)
+        backend = OllamaBackend("http://localhost:11434", keep_alive="1m")
+
+        assert backend.warm_up("gemma4:e2b") is True
+
+        sent = mock_post.call_args.kwargs["json"]
+        assert sent["keep_alive"] == "1m"
+
+    @patch("jarvis.llm.requests.post")
+    def test_warmup_loads_the_same_context_window_as_real_requests(self, mock_post):
         from jarvis.llm import OllamaBackend
 
         mock_post.return_value = MagicMock(status_code=200)
         backend = OllamaBackend("http://localhost:11434")
 
-        assert backend.warm_up("gemma4:e2b", keep_alive="1m") is True
+        backend.warm_up("gemma4:e2b")
 
         sent = mock_post.call_args.kwargs["json"]
-        assert sent["keep_alive"] == "1m"
+        assert sent["options"]["num_ctx"] == 8192
+        assert sent["options"]["num_predict"] == 1
+
+
+class TestOllamaBackendResidency:
+    """Ollama reloads a model runner whenever ``num_ctx`` changes and resets
+    residency to five minutes when ``keep_alive`` is absent. Every request
+    shape must therefore carry the same context window and the backend's
+    residency window."""
+
+    def _all_payloads(self, backend, mock_post):
+        mock_post.return_value = _make_response(
+            json_data={"message": {"content": "ok"}},
+            iter_lines=[b'{"message": {"content": "ok"}}'],
+        )
+        payloads = []
+        backend.chat("m", [{"role": "user", "content": "hi"}])
+        payloads.append(mock_post.call_args.kwargs["json"])
+        backend.direct("m", "sys", "user", max_tokens=50)
+        payloads.append(mock_post.call_args.kwargs["json"])
+        backend.streaming("m", "sys", "user")
+        payloads.append(mock_post.call_args.kwargs["json"])
+        return payloads
+
+    @patch("jarvis.llm.requests.post")
+    def test_every_request_shares_one_context_window(self, mock_post):
+        from jarvis.llm import OllamaBackend
+
+        payloads = self._all_payloads(OllamaBackend("http://x:1"), mock_post)
+
+        assert {p["options"]["num_ctx"] for p in payloads} == {8192}
+
+    @patch("jarvis.llm.requests.post")
+    def test_every_request_carries_the_backend_keep_alive(self, mock_post):
+        from jarvis.llm import OllamaBackend
+
+        payloads = self._all_payloads(OllamaBackend("http://x:1", keep_alive="1m"), mock_post)
+
+        assert {p["keep_alive"] for p in payloads} == {"1m"}
+
+    @patch("jarvis.llm.requests.post")
+    def test_callers_cannot_override_residency(self, mock_post):
+        from jarvis.llm import OllamaBackend
+
+        mock_post.return_value = _make_response(json_data={"message": {"content": "ok"}})
+        backend = OllamaBackend("http://x:1")
+
+        backend.chat("m", [{"role": "user", "content": "hi"}],
+                     extra_options={"keep_alive": "5m", "num_ctx": 2048})
+
+        sent = mock_post.call_args.kwargs["json"]
+        assert sent["keep_alive"] == "30m"
+        assert sent["options"]["num_ctx"] == 8192
+
+    def test_factory_uses_short_residency_in_low_power_mode(self):
+        from types import SimpleNamespace
+        from jarvis.llm import get_llm_backend, get_embedding_backend
+
+        cfg = SimpleNamespace(llm_provider="ollama", ollama_base_url="http://x:1", low_power_mode=True)
+        assert get_llm_backend(cfg).keep_alive == "1m"
+        assert get_embedding_backend(cfg).keep_alive == "1m"
+
+        cfg.low_power_mode = False
+        assert get_llm_backend(cfg).keep_alive == "30m"
 
 
 # ---------------------------------------------------------------------------
@@ -484,15 +560,39 @@ class TestOllamaBackendEmbed:
     def test_returns_vector(self, mock_post):
         from jarvis.llm import OllamaBackend
 
-        resp = MagicMock()
-        resp.json.return_value = {"embedding": [0.1, 0.2, 0.3]}
-        resp.raise_for_status = MagicMock()
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
         mock_post.return_value = resp
         backend = OllamaBackend("http://localhost:11434")
 
         vec = backend.embed("hello", "nomic-embed-text")
 
         assert vec == [0.1, 0.2, 0.3]
+        assert mock_post.call_args.args[0].endswith("/api/embed")
+        assert mock_post.call_args.kwargs["json"]["input"] == "hello"
+
+    @patch("jarvis.llm.requests.post")
+    def test_falls_back_to_legacy_endpoint_on_older_servers(self, mock_post):
+        from jarvis.llm import OllamaBackend
+
+        missing = MagicMock(status_code=404)
+        legacy = MagicMock(status_code=200)
+        legacy.json.return_value = {"embedding": [0.4, 0.5]}
+        mock_post.side_effect = [missing, legacy]
+        backend = OllamaBackend("http://localhost:11434")
+
+        assert backend.embed("hello", "nomic-embed-text") == [0.4, 0.5]
+        assert mock_post.call_args.args[0].endswith("/api/embeddings")
+
+    @patch("jarvis.llm.requests.post")
+    def test_returns_none_on_timeout(self, mock_post):
+        import requests
+        from jarvis.llm import OllamaBackend
+
+        mock_post.side_effect = requests.exceptions.Timeout("slow")
+        backend = OllamaBackend("http://localhost:11434")
+
+        assert backend.embed("hello", "nomic-embed-text", timeout_sec=1.0) is None
 
     @patch("jarvis.llm.requests.post")
     def test_returns_none_on_error(self, mock_post):

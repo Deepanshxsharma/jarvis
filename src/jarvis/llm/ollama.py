@@ -1,16 +1,16 @@
 """Ollama implementation of :class:`LLMBackend`.
 
-This module owns the original behaviour of the previous flat
-``src/jarvis/llm.py``: HTTP calls against ``/api/chat``,
-``/api/embeddings`` and ``/api/tags``, native tool calling with the
-``tools`` parameter (Ollama 0.4+), and the same fail-soft error
-handling (return ``None`` on timeouts / connection errors;
-:class:`ToolsNotSupportedError` on HTTP 400 with tools).
+HTTP calls against ``/api/chat``, ``/api/embed`` and ``/api/tags``,
+native tool calling with the ``tools`` parameter (Ollama 0.4+), and
+fail-soft error handling (return ``None`` on timeouts / connection
+errors; :class:`ToolsNotSupportedError` on HTTP 400 with tools).
 
-Nothing about the wire shape, defaults, or response parsing has
-changed in this PR — the file is the previous implementation reshaped
-into a class so future PRs can drop in OpenAI-compatible and
-Anthropic-compatible siblings without touching call sites.
+Every request carries the same ``num_ctx`` and the backend's
+``keep_alive``. Ollama reloads a model runner whenever a request asks
+for a different context size, and a request without ``keep_alive``
+resets residency to the server default of five minutes, so letting
+call sites vary either knob causes multi-second cold reloads and
+discards the prompt KV cache between turns.
 """
 
 from __future__ import annotations
@@ -76,15 +76,37 @@ def extract_text_from_response(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+OLLAMA_NUM_CTX = 8192
+DEFAULT_OLLAMA_KEEP_ALIVE = "30m"
+_BACKEND_OWNED_KEYS = frozenset({"num_ctx", "keep_alive"})
+
+
 class OllamaBackend(LLMBackend):
     """:class:`LLMBackend` implementation that talks to a local Ollama server."""
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, keep_alive: str = DEFAULT_OLLAMA_KEEP_ALIVE) -> None:
         self._base_url = base_url.rstrip("/")
+        self._keep_alive = keep_alive
 
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    @property
+    def keep_alive(self) -> str:
+        return self._keep_alive
+
+    def _payload(self, model: str, messages: List[Dict[str, Any]], *, stream: bool,
+                 thinking: bool) -> Dict[str, Any]:
+        return {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "cache_prompt": True,
+            "keep_alive": self._keep_alive,
+            "options": {"num_ctx": OLLAMA_NUM_CTX},
+            "think": thinking,
+        }
 
     # ── chat ───────────────────────────────────────────────────────────
 
@@ -95,18 +117,11 @@ class OllamaBackend(LLMBackend):
         user_content: str,
         timeout_sec: float = 10.0,
         thinking: bool = False,
-        num_ctx: int = 4096,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> Optional[str]:
         """Direct LLM call without temporal context, location, or other
         ``ask_coach`` features.
-
-        ``num_ctx`` controls Ollama's context window for this call.
-        Default 4096 is fine for small classification-shaped passes;
-        callers that assemble richer prompts (planner with dialogue +
-        memory + tool catalogue) should pass a larger value to avoid
-        silent truncation.
 
         ``temperature`` is forwarded to Ollama when set. Pass ``0.0``
         for classification / extraction calls where determinism beats
@@ -124,20 +139,11 @@ class OllamaBackend(LLMBackend):
             {"role": "user", "content": user_content},
         ]
 
-        options: Dict[str, Any] = {"num_ctx": num_ctx}
+        payload = self._payload(chat_model, messages, stream=False, thinking=thinking)
         if temperature is not None:
-            options["temperature"] = temperature
+            payload["options"]["temperature"] = temperature
         if max_tokens is not None:
-            options["num_predict"] = max_tokens
-
-        payload: Dict[str, Any] = {
-            "model": chat_model,
-            "messages": messages,
-            "stream": False,
-            "cache_prompt": True,
-            "options": options,
-            "think": thinking,
-        }
+            payload["options"]["num_predict"] = max_tokens
 
         try:
             with requests.post(
@@ -188,14 +194,7 @@ class OllamaBackend(LLMBackend):
             {"role": "user", "content": user_content},
         ]
 
-        payload: Dict[str, Any] = {
-            "model": chat_model,
-            "messages": messages,
-            "stream": True,
-            "cache_prompt": True,
-            "options": {"num_ctx": 4096},
-            "think": thinking,
-        }
+        payload = self._payload(chat_model, messages, stream=True, thinking=thinking)
 
         try:
             with requests.post(
@@ -241,36 +240,33 @@ class OllamaBackend(LLMBackend):
         raw response JSON. Caller is responsible for interpreting
         assistant content (including JSON / tool calls).
 
-        Main agentic chat uses ``num_ctx=8192`` so the system prompt
-        (tool list + protocol guidance + memory context) does not
-        overflow and force Ollama to truncate the tool schema — small
-        models like ``gemma4:e2b`` then fall back to pre-trained
-        ``tool_code`` scaffolding instead of producing valid tool calls.
+        The pinned ``num_ctx`` (8192) keeps the system prompt (tool list +
+        protocol guidance + memory context) from overflowing and forcing
+        Ollama to truncate the tool schema — small models like
+        ``gemma4:e2b`` then fall back to pre-trained ``tool_code``
+        scaffolding instead of producing valid tool calls.
         """
         sanitised = strip_nonstandard_message_fields(messages)
-        payload: Dict[str, Any] = {
-            "model": chat_model,
-            "messages": sanitised,
-            "stream": False,
-            "cache_prompt": True,
-            "options": {"num_ctx": 8192},
-            "think": thinking,
-        }
+        payload = self._payload(chat_model, sanitised, stream=False, thinking=thinking)
         # ``extra_options`` keys land at the Ollama wire root for known
-        # request-level fields (``keep_alive``, ``format``, ``think``); the
-        # rest fold into the sampling-options dict. The split lets callers
-        # pin per-request keep-alive without learning Ollama's wire shape.
-        # ``max_tokens`` is the canonical generation cap across backends —
-        # translate it to Ollama's ``num_predict`` so callers don't need to
-        # know which knob each server speaks.
+        # request-level fields (``format``, ``think``); the rest fold into
+        # the sampling-options dict. ``max_tokens`` is the canonical
+        # generation cap across backends — translate it to Ollama's
+        # ``num_predict`` so callers don't need to know which knob each
+        # server speaks. ``num_ctx`` and ``keep_alive`` are owned by the
+        # backend and ignored here.
         if extra_options and isinstance(extra_options, dict):
             for key, value in extra_options.items():
-                if key in {"keep_alive", "format", "think"}:
+                if key in _BACKEND_OWNED_KEYS:
+                    continue
+                if key in {"format", "think"}:
                     payload[key] = value
                 elif key == "max_tokens":
                     payload["options"]["num_predict"] = int(value)
                 elif key == "options" and isinstance(value, dict):
                     for inner_key, inner_value in value.items():
+                        if inner_key in _BACKEND_OWNED_KEYS:
+                            continue
                         if inner_key == "max_tokens":
                             payload["options"]["num_predict"] = int(inner_value)
                         else:
@@ -324,20 +320,37 @@ class OllamaBackend(LLMBackend):
         model: str,
         timeout_sec: float = 15.0,
     ) -> Optional[List[float]]:
-        """Embed ``text`` via Ollama's ``/api/embeddings``."""
+        """Embed ``text`` via Ollama's ``/api/embed``.
+
+        Servers older than 0.3.4 lack ``/api/embed`` and answer 404; those
+        fall back to the legacy ``/api/embeddings`` endpoint. Both vectors
+        are usable interchangeably because the vector store L2-normalises
+        every vector before indexing and searching.
+        """
+        payload = {"model": model, "input": text, "keep_alive": self._keep_alive}
         try:
             resp = requests.post(
-                f"{self._base_url}/api/embeddings",
-                json={"model": model, "prompt": text},
-                timeout=timeout_sec,
+                f"{self._base_url}/api/embed", json=payload, timeout=timeout_sec,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            vec = data.get("embedding")
-            if isinstance(vec, list):
+            if resp.status_code == 404:
+                resp = requests.post(
+                    f"{self._base_url}/api/embeddings",
+                    json={"model": model, "prompt": text, "keep_alive": self._keep_alive},
+                    timeout=timeout_sec,
+                )
+                resp.raise_for_status()
+                vec = resp.json().get("embedding")
+            else:
+                resp.raise_for_status()
+                vectors = resp.json().get("embeddings")
+                vec = vectors[0] if isinstance(vectors, list) and vectors else None
+            if isinstance(vec, list) and vec:
                 return [float(x) for x in vec]
-        except Exception:
-            return None
+            debug_log(f"OllamaBackend.embed: no vector in response (model={model})", "llm")
+        except requests.exceptions.Timeout:
+            debug_log(f"OllamaBackend.embed: timeout after {timeout_sec}s (model={model})", "llm")
+        except Exception as e:
+            debug_log(f"OllamaBackend.embed: {type(e).__name__}: {e}", "llm")
         return None
 
     def list_models(self, timeout_sec: float = 5.0) -> List[str]:
@@ -361,18 +374,16 @@ class OllamaBackend(LLMBackend):
         self,
         model: str,
         timeout_sec: float = 60.0,
-        keep_alive: str = "30m",
     ) -> bool:
         """Probe ``/api/version`` to verify the server is Ollama, then issue a
         minimal ``/api/chat`` request so it loads ``model`` into resident memory
-        for the requested ``keep_alive`` duration. The chat-endpoint warmup
+        for the backend's ``keep_alive`` duration. The chat-endpoint warmup
         exercises the full inference pipeline (JIT compilation, KV-cache
         allocation) that an empty ``/api/generate`` would not trigger,
         preventing a timeout on the first real intent-judge or reply-engine
-        call. ``keep_alive`` is caller-supplied so low power mode can ask for a
-        short residency instead of holding the model for half an hour.
-        Best-effort: errors are swallowed so callers never crash on warmup
-        failure."""
+        call. It uses the same pinned ``num_ctx`` as real requests so the
+        runner it loads is the one they reuse. Best-effort: errors are
+        swallowed so callers never crash on warmup failure."""
         if not self._base_url or not model:
             return False
         try:
@@ -385,19 +396,18 @@ class OllamaBackend(LLMBackend):
                 return False
 
             remaining = max(1.0, timeout_sec - version_to)
+            payload = self._payload(
+                model,
+                [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "ping"},
+                ],
+                stream=False,
+                thinking=False,
+            )
+            payload["options"].update({"num_predict": 1, "temperature": 0.0})
             resp = requests.post(
-                f"{self._base_url}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": "ping"},
-                    ],
-                    "stream": False,
-                    "keep_alive": keep_alive,
-                    "options": {"num_predict": 1, "temperature": 0.0},
-                },
-                timeout=remaining,
+                f"{self._base_url}/api/chat", json=payload, timeout=remaining,
             )
             return resp.status_code == 200
         except Exception:
