@@ -122,7 +122,9 @@ def _capture_listener():
     obj._vad_seconds = 0.004
     obj._processing_thread = None
     obj._check_query_timeout = lambda: None
-    obj.echo_detector = SimpleNamespace(_utterance_start_time=1.0)
+    obj.echo_detector = SimpleNamespace(_utterance_start_time=1.0, track_utterance_timing=lambda *a: None)
+    obj._frame_ms = 20
+    obj._pre_roll = deque()
     obj.tts = None
     obj.is_speech_active = True
     obj._silence_frames = 5
@@ -190,3 +192,38 @@ def test_without_a_worker_utterances_are_transcribed_inline():
     obj._transcribe_utterance = transcribed.append
     obj._finalize_utterance()
     assert len(transcribed) == 1
+
+
+def test_length_limit_cut_repeats_the_last_second_in_the_next_utterance():
+    """A forced cut right after the wake word must not strand it."""
+    obj, _ = _capture_listener()
+    frames = [np.full(obj._frame_samples, i, dtype=np.float32) for i in range(100)]
+    obj._utterance_frames = list(frames)
+    transcribed = []
+    obj._transcribe_utterance = transcribed.append
+
+    obj._end_utterance(forced=True)
+
+    assert transcribed[0].audio.size == obj._frame_samples * 100
+    assert obj.is_speech_active
+    assert len(obj._utterance_frames) == 50  # 1 s of 20 ms frames
+    assert obj._utterance_frames[0][0] == 50
+
+
+def test_endpoint_cut_starts_the_next_utterance_empty():
+    obj, _ = _capture_listener()
+    obj._transcribe_utterance = lambda utt: None
+
+    obj._end_utterance(forced=False)
+
+    assert obj._utterance_frames == [] and not obj.is_speech_active
+
+
+def test_length_limit_cut_during_playback_does_not_overlap():
+    obj, _ = _capture_listener()
+    obj.tts = SimpleNamespace(is_speaking=lambda: True)
+    obj._transcribe_utterance = lambda utt: None
+
+    obj._end_utterance(forced=True)
+
+    assert obj._utterance_frames == [] and not obj.is_speech_active

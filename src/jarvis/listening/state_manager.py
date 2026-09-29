@@ -114,15 +114,10 @@ class StateManager:
 
         debug_log(f"added to collection: '{text}' -> '{self._pending_query}'", "state")
 
-    def touch_collection(self) -> None:
-        """Restart the silence timer while the user is still speaking.
-
-        The max collection duration still applies.
-        """
-        if not self.is_collecting():
-            return
+    def seconds_since_voice(self) -> float:
+        """Seconds since the collected query last grew."""
         with self._state_lock:
-            self._last_voice_time = time.time()
+            return time.time() - self._last_voice_time
 
     def get_pending_query(self) -> str:
         """Get the current pending query text."""

@@ -1701,7 +1701,8 @@ class TestCollectionWaitsForTheSpeaker:
     def test_collection_held_while_speech_is_being_captured(self):
         listener, _ = _create_listener()
         listener.state_manager.start_collection("what's the weather")
-        listener.state_manager._last_voice_time = time.time() - 60
+        # Past the 2 s silence window, inside the hold allowance.
+        listener.state_manager._last_voice_time = time.time() - 3.0
         listener.is_speech_active = True
 
         with patch.object(listener, "_submit_query") as submit:
@@ -1709,7 +1710,6 @@ class TestCollectionWaitsForTheSpeaker:
             submit.assert_not_called()
 
             listener.is_speech_active = False
-            listener.state_manager._last_voice_time = time.time() - 60
             listener._check_query_timeout()
 
         submit.assert_called_once_with("what's the weather")
@@ -1728,16 +1728,31 @@ class TestCollectionWaitsForTheSpeaker:
         assert listener.state_manager.is_collecting()
         listener.state_manager.stop()
 
-    def test_max_collection_time_still_applies_while_speech_continues(self):
+    def test_continuous_background_noise_cannot_hold_a_query(self):
         listener, _ = _create_listener()
-        listener.state_manager.start_collection("endless")
-        listener.state_manager._collect_start_time = time.time() - 3600
+        listener.state_manager.start_collection("what's the weather")
+        listener.state_manager._last_voice_time = time.time() - 60
         listener.is_speech_active = True
 
         with patch.object(listener, "_submit_query") as submit:
             listener._check_query_timeout()
 
-        submit.assert_called_once_with("endless")
+        submit.assert_called_once_with("what's the weather")
+        listener.state_manager.stop()
+
+    def test_thinking_tune_heard_by_the_mic_does_not_hold_a_query(self):
+        """The mic hears Jarvis's own thinking tune as speech."""
+        listener, _ = _create_listener()
+        listener.state_manager.start_collection("what's the weather")
+        listener.state_manager._last_voice_time = time.time() - 3.0
+        listener.is_speech_active = True
+        listener._tune_player = MagicMock()
+
+        with patch.object(listener, "_submit_query") as submit:
+            listener._check_query_timeout()
+
+        submit.assert_called_once_with("what's the weather")
+        listener._tune_player = None
         listener.state_manager.stop()
 
 

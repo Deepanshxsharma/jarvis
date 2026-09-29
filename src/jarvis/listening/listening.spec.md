@@ -10,7 +10,10 @@ The input stream tries the configured sample rate and falls back to the selected
 device's native rate when rejected. Frames always span the configured 10, 20 or
 30 ms at the actual capture rate; unsupported frame durations use 20 ms. Partial
 callback blocks are retained until a complete frame is available and discarded
-on audio-state resets. WebRTC VAD receives a 16 kHz mono PCM copy, including when
+on audio-state resets. An utterance ends after `endpoint_silence_ms` of silence or
+at `max_utterance_ms` (`tts_max_utterance_ms` during playback). A length-limit cut
+outside playback repeats its last second at the start of the next utterance, so a
+wake word spoken at the seam is not split. WebRTC VAD receives a 16 kHz mono PCM copy, including when
 the hardware captures at 44.1 or 48 kHz. Utterances retain native-rate samples
 until resampling for Whisper, preserving their duration.
 
@@ -381,7 +384,7 @@ Three threads keep capture independent of the models:
 - **Processing worker:** Whisper, transcript filters, wake detection, the intent judge and collection timeouts. At shutdown it drains the utterances already captured.
 - **Reply worker:** the reply engine and TTS, one query at a time, in the order accepted.
 
-**Collection:** After a query is accepted it is dispatched once the user has been silent for `voice_collect_seconds`. The silence timer is held while the capture thread is mid-utterance or utterances are waiting for Whisper, so a continuation joins the query instead of becoming a separate one. `voice_max_collect_seconds` still caps the total.
+**Collection:** After a query is accepted it is dispatched once the collected text has not grown for `voice_collect_seconds`. Dispatch waits while utterances are queued for Whisper, and while the capture thread is mid-utterance, so a continuation joins the query instead of becoming a separate one. Mid-utterance VAD activity is ignored while the thinking tune plays (the mic hears the tune as speech) and counts for at most 3 s beyond the silence window, so background noise cannot hold a query. `voice_max_collect_seconds` caps the total.
 
 **Timing line:** Each turn prints one latency breakdown, measured with `perf_counter`:
 

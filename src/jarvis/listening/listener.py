@@ -392,6 +392,9 @@ class _Utterance:
     vad_seconds: float = 0.0  # VAD compute spent on this utterance
 
 
+_SPEECH_HOLD_MAX_SECONDS = 3.0
+_FORCED_CUT_OVERLAP_MS = 1000
+
 _VOICE_TIMING_ORDER = ("capture", "vad", "whisper", "intent", "collect", "chat", "tts_first_audio")
 
 
@@ -1531,16 +1534,26 @@ class VoiceListener(threading.Thread):
         return False
 
     def _speech_pending(self) -> bool:
-        """True while the user is mid-utterance or captured speech awaits Whisper."""
-        return bool(self.is_speech_active) or not self._utterance_q.empty()
+        """True while captured speech awaits Whisper or the user is mid-utterance.
+
+        VAD activity only counts while the thinking tune is silent (the mic
+        hears the tune as speech) and for at most `_SPEECH_HOLD_MAX_SECONDS`
+        beyond the silence window, so background noise cannot hold a query.
+        """
+        if not self._utterance_q.empty():
+            return True
+        if not self.is_speech_active or self._tune_player is not None:
+            return False
+        hold_limit = self.state_manager.voice_collect_seconds + _SPEECH_HOLD_MAX_SECONDS
+        return self.state_manager.seconds_since_voice() < hold_limit
 
     def _check_query_timeout(self) -> None:
         """Check if there's a pending query that has timed out, and check hot window expiry."""
         if self.state_manager.is_collecting() and self._speech_pending():
             # The user is still talking: keep collecting so a continuation
             # joins this query instead of becoming a separate one.
-            self.state_manager.touch_collection()
-        if self.state_manager.check_collection_timeout():
+            pass
+        elif self.state_manager.check_collection_timeout():
             query = self.state_manager.clear_collection()
             if query.strip():
                 self._submit_query(query)
@@ -2227,6 +2240,7 @@ class VoiceListener(threading.Thread):
             debug_log(f"Unsupported VAD frame duration {frame_ms}; using 20 ms", "voice")
             frame_ms = 20
         self._frame_samples = max(1, int(self._samplerate * frame_ms / 1000))
+        self._frame_ms = frame_ms
         pre_roll_ms = int(getattr(self.cfg, "vad_pre_roll_ms", 240))
         endpoint_silence_ms = int(getattr(self.cfg, "endpoint_silence_ms", 800))
         max_utt_ms = int(getattr(self.cfg, "max_utterance_ms", 12000))
@@ -2485,8 +2499,7 @@ class VoiceListener(threading.Thread):
                                 # Use shorter timeout during TTS for quick stop command detection
                                 current_max_frames = tts_max_utt_frames if (self.tts and self.tts.is_speaking()) else normal_max_utt_frames
                                 if self._silence_frames >= endpoint_silence_frames or len(self._utterance_frames) >= current_max_frames:
-                                    self._finalize_utterance()
-                                    self._pre_roll.clear()
+                                    self._end_utterance(forced=self._silence_frames < endpoint_silence_frames)
             finally:
                 self._stop_workers()
 
@@ -2515,6 +2528,27 @@ class VoiceListener(threading.Thread):
             self._query_q.put(None)
             self._reply_thread.join(timeout=2)
             self._reply_thread = None
+
+    def _end_utterance(self, forced: bool) -> None:
+        """Finish the current utterance at an endpoint or the length limit.
+
+        A length-limit cut can land in a brief pause mid-sentence, often
+        right after the wake word, so outside playback the next utterance
+        starts with the last `_FORCED_CUT_OVERLAP_MS` of audio and nothing is
+        lost at the seam.
+        """
+        carry = []
+        if forced and not (self.tts and self.tts.is_speaking()):
+            overlap_frames = max(1, _FORCED_CUT_OVERLAP_MS // self._frame_ms)
+            carry = list(self._utterance_frames[-overlap_frames:])
+        self._finalize_utterance()
+        self._pre_roll.clear()
+        if carry:
+            self.is_speech_active = True
+            self._vad_seconds = 0.0
+            self._utterance_frames = carry
+            self.echo_detector.track_utterance_timing(
+                time.time() - len(carry) * self._frame_ms / 1000.0, 0.0)
 
     def _finalize_utterance(self) -> None:
         """Cut the current utterance and hand it to the processing worker.
