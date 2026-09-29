@@ -49,6 +49,11 @@ _cgnat_resolution_cache: Dict[str, tuple[datetime, Optional[str]]] = {}
 # TTL for CGNAT OpenDNS resolution attempts
 _CGNAT_RESOLUTION_TTL = timedelta(hours=1)
 
+# Auto-detected external IP: (timestamp, ip or None). UPnP discovery can take
+# several seconds on some routers, and the reply engine asks for location on
+# every turn, so detection runs at most once per `location_cache_minutes`.
+_auto_ip_cache: Optional[tuple[datetime, Optional[str]]] = None
+
 # Disk cache paths (share directory with geoip DB for locality)
 def _cache_base_dir() -> Path:
     return Path.home() / ".local" / "share" / "jarvis"
@@ -409,19 +414,36 @@ def get_location_info(
         resolve_cgnat_public_ip: If True and a CGNAT (100.64.0.0/10) address is detected, attempt a single DNS query via OpenDNS to discover the true public IP (privacy-light).
         location_cache_minutes: TTL in minutes for cached location lookups persisted to disk.
     """
+    global _auto_ip_cache
+
     if not GEOIP2_AVAILABLE:
         return {"error": "geoip2 library not available"}
+
+    # Without the database no lookup can succeed, so skip IP detection
+    # (and its network round-trips) entirely.
+    db_path = _get_database_path()
+    if not db_path.exists():
+        _download_geolite2_database()
+        return {"error": "GeoLite2 database not available"}
 
     # Get IP address to lookup (prioritize parameter, then config, then auto-detect)
     if ip_address is None:
         if config_ip:
             ip_address = config_ip
         elif auto_detect:
-            # Try automatic detection using privacy-friendly methods
-            ip_address = _get_external_ip_automatically()
-            if not ip_address:
-                # Final fallback to local IP (won't work for geolocation)
-                ip_address = _get_local_network_ip()
+            now = datetime.now(timezone.utc)
+            with _cache_lock:
+                cached_auto = _auto_ip_cache
+            if cached_auto and now - cached_auto[0] < timedelta(minutes=location_cache_minutes):
+                ip_address = cached_auto[1]
+            else:
+                # Try automatic detection using privacy-friendly methods
+                ip_address = _get_external_ip_automatically()
+                if not ip_address:
+                    # Final fallback to local IP (won't work for geolocation)
+                    ip_address = _get_local_network_ip()
+                with _cache_lock:
+                    _auto_ip_cache = (now, ip_address)
         else:
             # Fall back to local IP without auto-detection
             ip_address = _get_local_network_ip()
@@ -480,12 +502,6 @@ def get_location_info(
             if 'ip' not in cached:
                 cached['ip'] = ip_address
             return cached.copy()
-
-    # Check if database is available
-    db_path = _get_database_path()
-    if not db_path.exists():
-        if not _download_geolite2_database():
-            return {"error": "GeoLite2 database not available"}
 
     try:
         with geoip2.database.Reader(str(db_path)) as reader:

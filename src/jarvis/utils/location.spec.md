@@ -20,6 +20,8 @@ This specification documents the location detection module (`src/jarvis/utils/lo
 
 ### IP Resolution Chain
 
+`get_location_info` first checks that the GeoLite2 database exists. Without it no lookup can succeed, so it returns `{"error": "GeoLite2 database not available"}` immediately (printing the setup instructions once per session) and runs no IP detection or network query.
+
 When `get_location_info` is called without an explicit `ip_address`:
 
 1. **Manual IP** (`config_ip`) — used as-is if provided.
@@ -39,7 +41,9 @@ If the resolved IP falls within the CGNAT range (`100.64.0.0/10`) and `resolve_c
 
 ### Caching
 
-Two independent caches exist, each with in-memory and on-disk tiers:
+The auto-detected IP (the result of the auto-detection chain, including the local IP fallback) is held in memory for `location_cache_minutes`. The reply engine asks for location on every turn and UPnP discovery can take several seconds on some routers, so detection runs at most once per window.
+
+Two further independent caches exist, each with in-memory and on-disk tiers:
 
 | Cache | Key | Value | Disk path | TTL |
 |-------|-----|-------|-----------|-----|

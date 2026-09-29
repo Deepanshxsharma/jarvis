@@ -108,6 +108,37 @@ def test_auto_detect_returns_none_when_all_methods_fail():
         assert result is None
 
 
+def test_missing_database_skips_ip_detection(tmp_path):
+    """Without a GeoLite2 database no lookup can succeed, so no network
+    detection (UPnP can take seconds) runs on the reply path."""
+    from jarvis.utils import location
+
+    with patch.object(location, "_get_database_path", return_value=tmp_path / "missing.mmdb"), \
+         patch.object(location, "_download_geolite2_database", return_value=False), \
+         patch.object(location, "_get_external_ip_automatically") as detect:
+        result = location.get_location_info(auto_detect=True)
+
+    detect.assert_not_called()
+    assert result == {"error": "GeoLite2 database not available"}
+
+
+def test_auto_detected_ip_is_reused_within_cache_window(tmp_path):
+    """Auto-detection runs once per cache window rather than once per reply."""
+    from jarvis.utils import location
+
+    db = tmp_path / "GeoLite2-City.mmdb"
+    db.write_bytes(b"")
+    with patch.object(location, "_get_database_path", return_value=db), \
+         patch.object(location, "_auto_ip_cache", None), \
+         patch.object(location, "_location_cache", {"203.0.113.9": {"city": "Pune", "ip": "203.0.113.9"}}), \
+         patch.object(location, "_get_external_ip_automatically", return_value="203.0.113.9") as detect:
+        first = location.get_location_info(auto_detect=True, resolve_cgnat_public_ip=False)
+        second = location.get_location_info(auto_detect=True, resolve_cgnat_public_ip=False)
+
+    assert detect.call_count == 1
+    assert first["city"] == second["city"] == "Pune"
+
+
 def test_auto_detect_rejects_private_ip_from_opendns():
     """Private IPs from OpenDNS are rejected (not returned as valid)."""
     with patch("jarvis.utils.location._get_external_ip_via_upnp", return_value=None), \
