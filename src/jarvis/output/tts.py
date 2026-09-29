@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import warnings
+from collections import deque
 from pathlib import Path
 from typing import Optional, Callable
 from urllib.parse import urlparse
@@ -387,6 +388,7 @@ class ChatterboxTTS:
         self._last_spoken_text: str = ""
         self._completion_callback: Optional[Callable[[], None]] = None
         self._duration_callback: Optional[Callable[[float], None]] = None
+        self._first_audio_callback: Optional[Callable[[], None]] = None
         self._should_interrupt = threading.Event()
 
         # Chatterbox model (eagerly loaded during initialization)
@@ -479,7 +481,8 @@ class ChatterboxTTS:
         self._stop.clear()
 
     def speak(self, text: str, completion_callback: Optional[Callable[[], None]] = None,
-              duration_callback: Optional[Callable[[float], None]] = None) -> None:
+              duration_callback: Optional[Callable[[float], None]] = None,
+              first_audio_callback: Optional[Callable[[], None]] = None) -> None:
         if not self.enabled or not text.strip():
             return
         # Lazy start the worker thread and lazy init on first speak
@@ -487,6 +490,7 @@ class ChatterboxTTS:
             self.start()
         self._completion_callback = completion_callback
         self._duration_callback = duration_callback
+        self._first_audio_callback = first_audio_callback
         # Preprocess text for speech (convert links to readable descriptions)
         processed_text = _preprocess_for_speech(text)
         try:
@@ -564,6 +568,11 @@ class ChatterboxTTS:
                 pygame.mixer.init(frequency=self._model.sr, size=-16, channels=1, buffer=1024)
                 pygame.mixer.music.load(tmp_path)
                 pygame.mixer.music.play()
+                if self._first_audio_callback is not None:
+                    try:
+                        self._first_audio_callback()
+                    except Exception as e:
+                        debug_log(f"Chatterbox TTS first-audio callback error: {e}", "tts")
 
                 # Wait for playback to complete or interruption
                 while pygame.mixer.music.get_busy():
@@ -664,6 +673,7 @@ class PiperTTS:
         self._last_spoken_text: str = ""
         self._completion_callback: Optional[Callable[[], None]] = None
         self._duration_callback: Optional[Callable[[float], None]] = None
+        self._first_audio_callback: Optional[Callable[[], None]] = None
         self._should_interrupt = threading.Event()
 
         # Piper voice (lazy loaded)
@@ -784,7 +794,8 @@ class PiperTTS:
         self._stop.clear()
 
     def speak(self, text: str, completion_callback: Optional[Callable[[], None]] = None,
-              duration_callback: Optional[Callable[[float], None]] = None) -> None:
+              duration_callback: Optional[Callable[[float], None]] = None,
+              first_audio_callback: Optional[Callable[[], None]] = None) -> None:
         if not self.enabled or not text.strip():
             return
         # Lazy start the worker thread
@@ -792,6 +803,7 @@ class PiperTTS:
             self.start()
         self._completion_callback = completion_callback
         self._duration_callback = duration_callback
+        self._first_audio_callback = first_audio_callback
         # Preprocess text for speech
         processed_text = _preprocess_for_speech(text)
         try:
@@ -852,7 +864,10 @@ class PiperTTS:
                 debug_log("Piper TTS interrupted before synthesis", "tts")
                 return
 
-            # Synthesize audio - synthesize() returns an iterable of AudioChunks
+            # Piper yields one AudioChunk per sentence. Playback starts as soon
+            # as the first sentence is ready and later sentences are appended
+            # while it plays, so time-to-first-audio does not grow with the
+            # length of the reply.
             from piper.config import SynthesisConfig
             syn_config = SynthesisConfig(
                 speaker_id=self.speaker,
@@ -860,72 +875,85 @@ class PiperTTS:
                 noise_scale=self.noise_scale,
                 noise_w_scale=self.noise_w,
             )
-            audio_chunks = []
-            for chunk in self._voice.synthesize(text, syn_config):
-                if self._should_interrupt.is_set():
-                    debug_log("Piper TTS interrupted during synthesis", "tts")
-                    return
-                audio_chunks.append(chunk.audio_int16_array)
-
-            # Check for interruption after synthesis
-            if self._should_interrupt.is_set():
-                debug_log("Piper TTS interrupted after synthesis", "tts")
-                return
-
-            # Concatenate all audio chunks
-            if not audio_chunks:
-                debug_log("Piper TTS: no audio chunks generated", "tts")
-                return
-
-            full_audio = np.concatenate(audio_chunks)
-
-            if len(full_audio) == 0:
-                debug_log("Piper TTS: no audio generated", "tts")
-                return
-
-            # Calculate exact duration from actual samples
-            exact_duration = len(full_audio) / self._sample_rate
-            debug_log(f"Piper TTS synthesis complete: {exact_duration:.2f}s, {len(full_audio)} samples", "tts")
-
-            # Notify listener of exact duration for precise echo detection
-            if self._duration_callback is not None:
-                try:
-                    self._duration_callback(exact_duration)
-                except Exception as e:
-                    debug_log(f"Piper TTS duration callback error: {e}", "tts")
-
-            # Play audio with streaming for interruption support
-            play_position = [0]
+            pending: deque = deque()
+            pending_lock = threading.Lock()
+            synthesis_done = threading.Event()
+            current = [np.zeros(0, dtype=np.int16), 0]  # [chunk, offset]
             blocksize = 1024  # Small blocks for responsive interruption
 
             def audio_callback(outdata, frames, time_info, status):
                 if self._should_interrupt.is_set():
                     raise sd.CallbackAbort()
+                filled = 0
+                while filled < frames:
+                    chunk, offset = current
+                    if offset >= len(chunk):
+                        with pending_lock:
+                            next_chunk = pending.popleft() if pending else None
+                        if next_chunk is None:
+                            break
+                        current[0], current[1] = next_chunk, 0
+                        continue
+                    take = min(frames - filled, len(chunk) - offset)
+                    outdata[filled:filled + take, 0] = chunk[offset:offset + take]
+                    current[1] = offset + take
+                    filled += take
+                if filled < frames:
+                    # Synthesis is still running: play silence until the next
+                    # sentence lands. Once it has finished, this is the end.
+                    outdata[filled:, 0] = 0
+                    if synthesis_done.is_set():
+                        with pending_lock:
+                            drained = not pending
+                        if drained:
+                            raise sd.CallbackStop()
 
-                start = play_position[0]
-                end = start + frames
-                chunk = full_audio[start:end]
+            total_samples = 0
+            for chunk in self._voice.synthesize(text, syn_config):
+                if self._should_interrupt.is_set():
+                    debug_log("Piper TTS interrupted during synthesis", "tts")
+                    interrupted = True
+                    break
+                samples = np.asarray(chunk.audio_int16_array, dtype=np.int16).reshape(-1)
+                if samples.size == 0:
+                    continue
+                with pending_lock:
+                    pending.append(samples)
+                total_samples += samples.size
+                if self._audio_stream is None:
+                    with self._audio_lock:
+                        with portaudio_lock:
+                            self._audio_stream = sd.OutputStream(
+                                samplerate=self._sample_rate,
+                                channels=1,
+                                dtype='int16',
+                                blocksize=blocksize,
+                                callback=audio_callback,
+                            )
+                            self._audio_stream.start()
+                    debug_log(f"Piper TTS first audio after {time.time() - start_time:.2f}s", "tts")
+                    if self._first_audio_callback is not None:
+                        try:
+                            self._first_audio_callback()
+                        except Exception as e:
+                            debug_log(f"Piper TTS first-audio callback error: {e}", "tts")
+            synthesis_done.set()
 
-                if len(chunk) < frames:
-                    # Pad with zeros if we're at the end
-                    outdata[:len(chunk), 0] = chunk
-                    outdata[len(chunk):, 0] = 0
-                    raise sd.CallbackStop()
-                else:
-                    outdata[:, 0] = chunk
+            if total_samples == 0 and not interrupted:
+                debug_log("Piper TTS: no audio generated", "tts")
+                return
 
-                play_position[0] = end
-
-            with self._audio_lock:
-                with portaudio_lock:
-                    self._audio_stream = sd.OutputStream(
-                        samplerate=self._sample_rate,
-                        channels=1,
-                        dtype='int16',
-                        blocksize=blocksize,
-                        callback=audio_callback,
-                    )
-                    self._audio_stream.start()
+            if not interrupted:
+                exact_duration = total_samples / self._sample_rate
+                debug_log(f"Piper TTS synthesis complete: {exact_duration:.2f}s, {total_samples} samples", "tts")
+                # Notify listener of exact duration for precise echo detection
+                if self._duration_callback is not None:
+                    try:
+                        self._duration_callback(exact_duration)
+                    except Exception as e:
+                        debug_log(f"Piper TTS duration callback error: {e}", "tts")
+            else:
+                exact_duration = total_samples / self._sample_rate
 
             # Wait for playback to complete
             try:
@@ -947,6 +975,10 @@ class PiperTTS:
                         except Exception:
                             pass
                         self._audio_stream = None
+            # The audio callback may abort the stream before the loop above
+            # sees the flag; that is still an interruption.
+            if self._should_interrupt.is_set():
+                interrupted = True
 
             actual_duration = time.time() - start_time
             debug_log(f"Piper TTS complete: actual={actual_duration:.2f}s (audio={exact_duration:.2f}s)", "tts")

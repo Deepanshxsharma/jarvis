@@ -634,3 +634,141 @@ class TestPiperVoiceDownloadRetry:
         assert result is None
         # Should only call once for the onnx file (no retry)
         assert get_call_count == 1
+
+
+class _FakeOutputStream:
+    """Plays through the callback on a thread, like PortAudio does."""
+
+    def __init__(self, sd, samplerate, channels, dtype, blocksize, callback):
+        self._sd = sd
+        self._blocksize = blocksize
+        self._callback = callback
+        self._thread = None
+        self.active = False
+        self.played = sd.played
+
+    def start(self):
+        import numpy as np
+        self.active = True
+
+        def run():
+            while self.active:
+                out = np.zeros((self._blocksize, 1), dtype=np.int16)
+                try:
+                    self._callback(out, self._blocksize, None, None)
+                except self._sd.CallbackStop:
+                    self.played.append(out.copy())
+                    break
+                except self._sd.CallbackAbort:
+                    break
+                self.played.append(out.copy())
+                time.sleep(0.001)
+            self.active = False
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+    def abort(self):
+        self.active = False
+
+    def close(self):
+        self.active = False
+
+
+def _fake_sounddevice():
+    import types
+    sd = types.ModuleType("sounddevice")
+
+    class CallbackStop(Exception):
+        pass
+
+    class CallbackAbort(Exception):
+        pass
+
+    sd.CallbackStop = CallbackStop
+    sd.CallbackAbort = CallbackAbort
+    sd.played = []
+    sd.OutputStream = lambda **kw: _FakeOutputStream(sd, **kw)
+    return sd
+
+
+class _Chunk:
+    def __init__(self, samples):
+        self.audio_int16_array = samples
+
+
+class TestPiperStreamingPlayback:
+    """Speech starts before the whole reply is synthesised."""
+
+    def _tts(self, synthesize):
+        from src.jarvis.output.tts import PiperTTS
+        tts = PiperTTS(enabled=True)
+        tts._initialized = True
+        tts._voice = MagicMock()
+        tts._voice.synthesize.side_effect = synthesize
+        tts._sample_rate = 16000
+        return tts
+
+    def _speak(self, tts, text, **callbacks):
+        import sys as _sys
+        sd = _fake_sounddevice()
+        with patch.dict(_sys.modules, {"sounddevice": sd}):
+            tts._completion_callback = callbacks.get("completion")
+            tts._duration_callback = callbacks.get("duration")
+            tts._first_audio_callback = callbacks.get("first_audio")
+            tts._speak_once(text)
+        return sd
+
+    def test_first_sentence_plays_while_the_rest_is_synthesised(self):
+        import numpy as np
+        events = []
+        first = np.full(3000, 100, dtype=np.int16)
+        second = np.full(2000, 200, dtype=np.int16)
+
+        def synthesize(_text, _cfg):
+            events.append("first ready")
+            yield _Chunk(first)
+            time.sleep(0.2)
+            events.append("second ready")
+            yield _Chunk(second)
+
+        tts = self._tts(synthesize)
+        sd = self._speak(tts, "One. Two.", first_audio=lambda: events.append("first audio"))
+
+        assert events == ["first ready", "first audio", "second ready"]
+        played = np.concatenate(sd.played).reshape(-1)
+        nonsilent = played[played != 0]
+        np.testing.assert_array_equal(nonsilent, np.concatenate([first, second]))
+
+    def test_exact_duration_reported_once_synthesis_finishes(self):
+        import numpy as np
+        durations = []
+        tts = self._tts(lambda _t, _c: iter([_Chunk(np.ones(8000, dtype=np.int16)),
+                                            _Chunk(np.ones(8000, dtype=np.int16))]))
+        self._speak(tts, "One. Two.", duration=durations.append)
+        assert durations == [1.0]
+
+    def test_interrupt_stops_playback_without_completion(self):
+        import numpy as np
+        completed = []
+
+        def synthesize(_text, _cfg):
+            yield _Chunk(np.ones(16000 * 5, dtype=np.int16))
+
+        tts = self._tts(synthesize)
+        threading.Timer(0.05, tts.interrupt).start()
+        started = time.monotonic()
+        sd = self._speak(tts, "A very long sentence.", completion=lambda: completed.append(True))
+
+        assert time.monotonic() - started < 2
+        assert completed == []
+        played = sum(len(b) for b in sd.played)
+        assert played < 16000 * 5
+
+    def test_completion_fires_after_full_playback(self):
+        import numpy as np
+        completed = []
+        tts = self._tts(lambda _t, _c: iter([_Chunk(np.ones(4000, dtype=np.int16))]))
+        self._speak(tts, "Short.", completion=lambda: completed.append(True))
+        assert completed == [True]
+        assert not tts.is_speaking()
