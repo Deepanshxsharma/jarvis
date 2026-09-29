@@ -154,6 +154,11 @@ class Settings:
     wake_aliases: list[str]
     wake_fuzzy_ratio: float
 
+    # Speaking over Jarvis
+    stop_commands: list[str]  # silence playback / cancel a pending reply
+    stop_command_fuzzy_ratio: float
+    interrupt_commands: list[str]  # cut playback short and listen for a follow-up
+
     # Whisper Speech Recognition
     whisper_model: str
     whisper_backend: str  # "auto", "mlx", or "faster-whisper"
@@ -626,6 +631,9 @@ def get_default_config() -> Dict[str, Any]:
         # Stop Commands
         "stop_commands": ["stop", "quiet", "shush", "silence", "enough", "shut up"],
         "stop_command_fuzzy_ratio": 0.8,
+        # Matched as whole words while Jarvis is speaking: playback stops and
+        # the follow-up window opens so the next sentence needs no wake word.
+        "interrupt_commands": ["wait", "hold on", "hang on", "actually"],
 
         # Location Services
         "location_enabled": True,
@@ -768,6 +776,9 @@ def load_settings() -> Settings:
     wake_word = str(merged.get("wake_word", "jarvis")).strip().lower()
     wake_aliases = [a.strip().lower() for a in _ensure_list(merged.get("wake_aliases")) if a.strip()]
     wake_fuzzy_ratio = float(merged.get("wake_fuzzy_ratio", 0.78))
+    stop_commands = [c.strip().lower() for c in _ensure_list(merged.get("stop_commands")) if c.strip()]
+    stop_command_fuzzy_ratio = float(merged.get("stop_command_fuzzy_ratio", 0.8))
+    interrupt_commands = [c.strip().lower() for c in _ensure_list(merged.get("interrupt_commands")) if c.strip()]
     # whisper_model accepts a size name ("medium") or a local model
     # directory; _expand_path is a no-op for plain names.
     whisper_model = _expand_path(merged.get("whisper_model")) or "medium"
@@ -947,6 +958,11 @@ def load_settings() -> Settings:
         wake_word=wake_word,
         wake_aliases=wake_aliases,
         wake_fuzzy_ratio=wake_fuzzy_ratio,
+
+        # Speaking over Jarvis
+        stop_commands=stop_commands,
+        stop_command_fuzzy_ratio=stop_command_fuzzy_ratio,
+        interrupt_commands=interrupt_commands,
 
         # Whisper Speech Recognition
         whisper_model=whisper_model,

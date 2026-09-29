@@ -116,6 +116,18 @@ Both thresholds are exposed in the Settings window under *Whisper*.
 
 **LLM Intent Judge** - Jarvis uses a small LLM for intelligent voice intent classification (echo detection, query extraction, stop commands). On the default Ollama setup this is `gemma4:e2b`, installed automatically alongside your chosen chat model during setup. On an OpenAI-compatible provider the judge uses your served chat model instead, so there is nothing extra to install. The intent judge cannot be disabled but gracefully falls back to simpler text matching if the LLM server is unavailable.
 
+**Speaking over Jarvis** - While Jarvis is talking you can cut in. A stop phrase silences it. A short interrupt phrase ("actually, wait") stops it and opens the follow-up window, so your next sentence needs no wake word. A longer follow-up is accepted directly and replaces the current answer. A short stop phrase while Jarvis is still thinking cancels the answer before it is spoken. Both lists are yours to change, for example to add Hindi phrases:
+
+```json
+{
+  "stop_commands": ["stop", "quiet", "shush", "silence", "enough", "shut up", "ruko", "bas karo"],
+  "stop_command_fuzzy_ratio": 0.8,
+  "interrupt_commands": ["wait", "hold on", "hang on", "actually", "ek minute"]
+}
+```
+
+Both match whole words, so "stop" does not fire inside "stopwatch". After a query is accepted, Jarvis waits `voice_collect_seconds` of silence before answering, and never while you are still mid-sentence.
+
 **Tool Router** - When `"tool_selection_strategy": "llm"` (the default), Jarvis asks the fast model to pick which tools are relevant for each query, shrinking the tool catalogue the chat model sees. It's already warm and small enough not to stall the turn. Other strategies: `"keyword"` (fast, no LLM), `"embedding"` (nomic-embed-text), `"all"` (no filtering).
 
 **Task-list Planner** - Before the agentic loop, Jarvis runs a short planning pass that decomposes multi-step queries into an ordered list of sub-tasks. For small models (`gemma4:e2b` class), each planned step is directly resolved to a concrete tool call without relying on the chat model to re-plan turn-by-turn. This significantly improves multi-step reliability. Config options:
@@ -195,6 +207,7 @@ Customise the hotkey in Settings or `config.json`:
 - Works out of the box - no setup required
 - High-quality British English male voice (en_GB-alan-medium)
 - Fast local synthesis with exact duration tracking
+- Streams sentence by sentence: the first sentence plays while the rest is synthesised
 
 To use different Piper voices, download from [HuggingFace](https://huggingface.co/rhasspy/piper-voices) and set:
 ```json

@@ -2,6 +2,7 @@
 
 from typing import List, Optional
 import difflib
+import re
 
 from ..debug import debug_log
 
@@ -78,9 +79,31 @@ def extract_query_after_wake(text_lower: str, wake_word: str, aliases: List[str]
     return fragment if fragment else ""
 
 
+def _contains_phrase(text_lower: str, phrase: str) -> bool:
+    """True when *phrase* appears in *text_lower* as whole words, ignoring punctuation."""
+    words = re.sub(r"[^\w\s']", " ", text_lower).split()
+    phrase_words = re.sub(r"[^\w\s']", " ", phrase.lower()).split()
+    return bool(phrase_words) and f" {' '.join(phrase_words)} " in f" {' '.join(words)} "
+
+
+def is_interrupt_command(text_lower: str, interrupt_commands: List[str]) -> bool:
+    """Check if text contains an interrupt phrase as whole words.
+
+    Whole-word matching keeps "actually" from firing inside "factually" and
+    "wait" inside "waiter".
+    """
+    if not text_lower or not text_lower.strip():
+        return False
+    for phrase in interrupt_commands:
+        if _contains_phrase(text_lower, phrase):
+            debug_log(f"interrupt command detected: {phrase} in '{text_lower}'", "voice")
+            return True
+    return False
+
+
 def is_stop_command(text_lower: str, stop_commands: List[str], fuzzy_ratio: float = 0.8) -> bool:
     """
-    Check if text contains a stop command.
+    Check if text contains a stop command as whole words.
     
     Args:
         text_lower: Lowercase text to check
@@ -93,11 +116,9 @@ def is_stop_command(text_lower: str, stop_commands: List[str], fuzzy_ratio: floa
     if not text_lower or not text_lower.strip():
         return False
     
-    # Check for exact matches
-    detected_commands = []
-    for cmd in stop_commands:
-        if cmd in text_lower:
-            detected_commands.append(cmd)
+    # Whole-word matches, so "stop" does not fire inside "stopwatch" or a
+    # short phrase like "bas" inside "based" when Jarvis's own voice leaks in.
+    detected_commands = [cmd for cmd in stop_commands if _contains_phrase(text_lower, cmd)]
     
     # Check fuzzy matches for short inputs (2 words or less)
     if len(text_lower.split()) <= 2:

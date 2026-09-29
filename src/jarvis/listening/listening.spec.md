@@ -18,6 +18,8 @@ VAD errors emit a single warning and use the configured energy threshold instead
 of silently discarding speech. Capture health is checked every five seconds with
 a monotonic clock. Missing callbacks, silent samples, callback errors, PortAudio
 status flags and dropped queue blocks are reported outside the audio callback.
+The callback only copies the block into the queue; see [Audio Pipeline](#audio-pipeline)
+for the capture, processing and reply threads behind it.
 Warnings are transition-based; dictation pauses suspend health checks. With
 `voice_debug`, diagnostics include callback/frame counts, speech-frame counts,
 peak level and capture rate, without saving microphone audio. Linux warnings
@@ -199,8 +201,14 @@ After TTS finishes, allow wake-word-free follow-up.
 While TTS is playing, echo rejection and stop commands are handled with fast text-based checks (no LLM). This prevents self-loops where the mic picks up TTS output. After TTS finishes, the intent judge takes over.
 
 **Stop detection:**
-- Text-based: Check for "stop", "quiet", "shut up", etc.
+- Text-based: any phrase from `stop_commands` (whole-word match ignoring punctuation, plus fuzzy match for inputs of two words or fewer at `stop_command_fuzzy_ratio`) interrupts playback. The follow-up window does not open.
 - Intent judge can also detect stop commands
+
+**Barge-in (speaking over Jarvis):** Non-echo speech during playback is the user cutting in.
+- Three words or fewer containing a phrase from `interrupt_commands` as whole words (default "wait", "hold on", "hang on", "actually") interrupts playback and opens the hot window, so the follow-up ("actually, wait... make it Friday") needs no wake word. Other short speech ("uh huh") is ignored.
+- Longer non-echo speech is judged as a hot-window follow-up; if accepted, playback is interrupted before the new query is collected.
+
+**Cancelling a pending reply:** A stop command of three words or fewer while a query is being collected or the reply engine is still working cancels it: the collected query is dropped, or the finished reply is discarded instead of spoken (`🛑 Cancelled`). Longer speech never cancels, because a stop word inside a sentence is usually not a command ("when does the last bus stop").
 
 **Echo handling:**
 - Transcripts during TTS are flagged with `is_during_tts=true`
@@ -361,20 +369,38 @@ stateDiagram-v2
     HotWindow --> IntentJudge: Speech detected
     HotWindow --> WakeWord: Timer expires
     DuringTTS --> WakeWord: Stop command detected
+    DuringTTS --> HotWindow: Interrupt phrase detected
+    DuringTTS --> IntentJudge: Longer non-echo speech (barge-in)
 ```
 
 ## Audio Pipeline
+
+Three threads keep capture independent of the models:
+
+- **Capture (listener thread):** reads `_audio_q`, runs VAD, accumulates frames and cuts utterances. It never waits on Whisper, the LLM, TTS, MCP or disk, so the audio queue (500 blocks, about 10 s) only absorbs scheduling jitter. Utterances go to `_utterance_q` (8 deep); when recognition falls behind, the oldest waiting utterance is dropped with a visible `⚠️  Speech recognition is falling behind` warning.
+- **Processing worker:** Whisper, transcript filters, wake detection, the intent judge and collection timeouts. At shutdown it drains the utterances already captured.
+- **Reply worker:** the reply engine and TTS, one query at a time, in the order accepted.
+
+**Collection:** After a query is accepted it is dispatched once the user has been silent for `voice_collect_seconds`. The silence timer is held while the capture thread is mid-utterance or utterances are waiting for Whisper, so a continuation joins the query instead of becoming a separate one. `voice_max_collect_seconds` still caps the total.
+
+**Timing line:** Each turn prints one latency breakdown, measured with `perf_counter`:
+
+```
+⏱️  VOICE capture=42ms vad=19ms whisper=310ms intent=240ms collect=610ms chat=520ms tts_first_audio=180ms total=1.92s
+```
+
+`capture` is the wait between the VAD endpoint and Whisper starting, `vad` the VAD compute for the utterance, `intent` the time from transcript to acceptance, `collect` the collection window, `chat` the reply engine, and `tts_first_audio` the time from `speak()` to the first audio block. `total` runs from the VAD endpoint of the user's last utterance to the first audio (or to the reply being ready when TTS is off).
 
 ```
 Microphone Audio
     ↓
 Sounddevice Callback → _audio_q
     ↓
-Main Loop: Get Frames → VAD Check
+Capture thread: Get Frames → VAD Check
     ↓
 Speech Detected → Accumulate Frames
     ↓
-Silence Timeout → Whisper Transcription
+Silence Timeout → _utterance_q → Processing worker: Whisper Transcription
     ↓
 Add to Transcript Buffer (with timestamps)
     ↓
@@ -387,7 +413,7 @@ If wake detected OR in hot window:
     ↓
 If judge.directed and judge.query:
     → Verify wake word present (wake word mode) or non-echo (hot window)
-    → Dispatch query to Reply Engine
+    → Collect, then hand the query to the reply worker
 If judge rejects but in hot window and non-echo:
     → Override rejection, dispatch as query
 ```

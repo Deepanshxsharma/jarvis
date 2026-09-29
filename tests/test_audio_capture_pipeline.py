@@ -112,3 +112,81 @@ def test_callback_exception_is_not_silenced(capsys):
     obj._on_audio(BrokenInput(), 960, None, None)
     obj._check_audio_health(now=6)
     assert 'capture buffer failed' in capsys.readouterr().out
+
+
+def _capture_listener():
+    import threading
+    obj = listener(16000)
+    obj._utterance_q = queue.Queue(maxsize=8)
+    obj._utterances_dropped = 0
+    obj._vad_seconds = 0.004
+    obj._processing_thread = None
+    obj._check_query_timeout = lambda: None
+    obj.echo_detector = SimpleNamespace(_utterance_start_time=1.0)
+    obj.tts = None
+    obj.is_speech_active = True
+    obj._silence_frames = 5
+    obj._utterance_frames = [np.ones(obj._frame_samples, dtype=np.float32) * .1] * 10
+    return obj, threading
+
+
+def test_capture_does_not_wait_for_speech_recognition():
+    """Cutting an utterance returns at once even while Whisper is busy."""
+    import time
+    obj, threading = _capture_listener()
+    release = threading.Event()
+    transcribed = []
+
+    def slow_transcribe(utt):
+        release.wait(5)
+        transcribed.append(utt)
+
+    obj._transcribe_utterance = slow_transcribe
+    obj._processing_thread = threading.Thread(target=obj._processing_worker_loop, daemon=True)
+    obj._processing_thread.start()
+
+    started = time.monotonic()
+    obj._finalize_utterance()
+    assert time.monotonic() - started < 0.1
+    assert obj._utterance_frames == [] and not obj.is_speech_active
+
+    release.set()
+    obj._utterance_q.put(None)
+    obj._processing_thread.join(5)
+    assert len(transcribed) == 1
+    assert transcribed[0].audio.size == obj._frame_samples * 10
+    assert transcribed[0].samplerate == 16000
+    assert transcribed[0].start_time == 1.0
+
+
+def test_recognition_backlog_drops_oldest_utterance_visibly(capsys):
+    obj, threading = _capture_listener()
+    release = threading.Event()
+    seen = []
+
+    def blocked_transcribe(utt):
+        release.wait(5)
+        seen.append(utt.start_time)
+
+    obj._transcribe_utterance = blocked_transcribe
+    obj._processing_thread = threading.Thread(target=obj._processing_worker_loop, daemon=True)
+    obj._processing_thread.start()
+
+    from jarvis.listening.listener import _Utterance
+    for i in range(12):
+        obj._submit_utterance(_Utterance(np.zeros(10), 16000, float(i), float(i), 0.0, False))
+
+    release.set()
+    obj._utterance_q.put(None)
+    obj._processing_thread.join(5)
+    assert seen[-1] == 11.0
+    assert len(seen) < 12
+    assert 'falling behind' in capsys.readouterr().out
+
+
+def test_without_a_worker_utterances_are_transcribed_inline():
+    obj, _ = _capture_listener()
+    transcribed = []
+    obj._transcribe_utterance = transcribed.append
+    obj._finalize_utterance()
+    assert len(transcribed) == 1

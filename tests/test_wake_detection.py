@@ -8,6 +8,7 @@ from jarvis.listening.wake_detection import (
     is_wake_word_detected,
     extract_query_after_wake,
     is_stop_command,
+    is_interrupt_command,
 )
 
 
@@ -83,6 +84,37 @@ class TestStopCommand:
     def test_empty_text(self):
         assert is_stop_command("", ["stop", "quiet"]) is False
 
+    def test_stop_command_with_punctuation(self):
+        assert is_stop_command("okay, stop!", ["stop", "quiet"]) is True
+
+    def test_stop_command_inside_another_word_does_not_match(self):
+        assert is_stop_command("start the stopwatch please", ["stop", "quiet"]) is False
+
+    def test_multi_word_stop_command(self):
+        assert is_stop_command("oh just shut up now", ["shut up"]) is True
+
     def test_fuzzy_stop_command(self):
         """Short input fuzzy-matches stop commands."""
         assert is_stop_command("stob", ["stop", "quiet"], fuzzy_ratio=0.7) is True
+
+
+@pytest.mark.unit
+class TestInterruptCommand:
+    """Tests for is_interrupt_command."""
+
+    PHRASES = ["wait", "hold on", "actually"]
+
+    def test_phrase_with_punctuation(self):
+        assert is_interrupt_command("actually, wait.", self.PHRASES) is True
+
+    def test_multi_word_phrase(self):
+        assert is_interrupt_command("hold on a sec", self.PHRASES) is True
+
+    def test_phrase_inside_word_does_not_match(self):
+        assert is_interrupt_command("factually the waiter", self.PHRASES) is False
+
+    def test_split_phrase_does_not_match(self):
+        assert is_interrupt_command("hold it on", self.PHRASES) is False
+
+    def test_empty_text(self):
+        assert is_interrupt_command("", self.PHRASES) is False

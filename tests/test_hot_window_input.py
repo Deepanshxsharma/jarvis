@@ -1586,3 +1586,221 @@ class TestIntentJudgeGating:
 
         assert mock_judge.judge.call_count == 1
         listener.state_manager.stop()
+
+
+# ---------------------------------------------------------------------------
+# Tests: Speaking over Jarvis (barge-in, stop while thinking)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSpeakingOverJarvis:
+    """The user can cut Jarvis off mid-reply or cancel a pending answer."""
+
+    @patch("builtins.print")
+    def test_interrupt_phrase_stops_playback_and_opens_follow_up_window(self, _print):
+        listener, mock_tts = _create_listener(tts_speaking=True, echo_tolerance=0.02)
+        listener.cfg.interrupt_commands = ["wait", "hold on", "actually"]
+
+        listener._process_transcript("actually, wait", utterance_energy=0.01)
+
+        mock_tts.interrupt.assert_called_once()
+        mock_tts.is_speaking.return_value = False
+        assert _wait_for_hot_window_active(listener)
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_backchannel_during_playback_does_not_interrupt(self, _print):
+        listener, mock_tts = _create_listener(tts_speaking=True)
+        listener.cfg.interrupt_commands = ["wait", "hold on", "actually"]
+
+        listener._process_transcript("uh huh yeah", utterance_energy=0.01)
+
+        mock_tts.interrupt.assert_not_called()
+        assert _accepted_query(listener) == ""
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_interrupt_phrase_inside_another_word_does_not_interrupt(self, _print):
+        listener, mock_tts = _create_listener(tts_speaking=True)
+        listener.cfg.interrupt_commands = ["wait", "actually"]
+
+        listener._process_transcript("factually the waiter", utterance_energy=0.01)
+
+        mock_tts.interrupt.assert_not_called()
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_longer_follow_up_during_playback_cuts_in_and_is_accepted(self, _print):
+        listener, mock_tts = _create_listener(tts_speaking=True)
+        _install_intent_judge(listener, _make_judgment(
+            directed=True, query="what about tomorrow's weather"))
+
+        listener._process_transcript(
+            "no what about tomorrow's weather", utterance_energy=0.01)
+
+        mock_tts.interrupt.assert_called_once()
+        assert _accepted_query(listener) == "what about tomorrow's weather"
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_stop_while_reply_is_generating_discards_the_answer(self, _print):
+        import threading
+        listener, mock_tts = _create_listener()
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow_reply(*_args, **_kwargs):
+            started.set()
+            release.wait(5)
+            return "Here is the long answer you no longer want."
+
+        listener._reply_thread = threading.Thread(
+            target=listener._reply_worker_loop, daemon=True)
+        listener._reply_thread.start()
+        with patch("jarvis.reply.engine.run_reply_engine", side_effect=slow_reply):
+            listener._submit_query("tell me a long story")
+            assert started.wait(2)
+            listener._process_transcript("stop", utterance_energy=0.01)
+            release.set()
+            listener._query_q.put(None)
+            listener._reply_thread.join(5)
+
+        mock_tts.speak.assert_not_called()
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_sentence_mentioning_stop_does_not_cancel_pending_reply(self, _print):
+        listener, _ = _create_listener()
+        listener._reply_busy.set()
+
+        listener._process_transcript(
+            "when does the last bus stop tonight", utterance_energy=0.01)
+
+        assert not listener._reply_cancelled.is_set()
+        listener.state_manager.stop()
+
+    @patch("builtins.print")
+    def test_stop_during_collection_drops_the_query(self, _print):
+        listener, _ = _create_listener()
+        listener.state_manager.start_collection("what's the weather")
+
+        with patch.object(listener, "_submit_query") as submit:
+            listener._process_transcript("stop", utterance_energy=0.01)
+            listener.state_manager._last_voice_time = time.time() - 60
+            listener._check_query_timeout()
+
+        submit.assert_not_called()
+        assert not listener.state_manager.is_collecting()
+        listener.state_manager.stop()
+
+
+@pytest.mark.unit
+class TestCollectionWaitsForTheSpeaker:
+    """A query is not dispatched while the user is still talking."""
+
+    def test_collection_held_while_speech_is_being_captured(self):
+        listener, _ = _create_listener()
+        listener.state_manager.start_collection("what's the weather")
+        listener.state_manager._last_voice_time = time.time() - 60
+        listener.is_speech_active = True
+
+        with patch.object(listener, "_submit_query") as submit:
+            listener._check_query_timeout()
+            submit.assert_not_called()
+
+            listener.is_speech_active = False
+            listener.state_manager._last_voice_time = time.time() - 60
+            listener._check_query_timeout()
+
+        submit.assert_called_once_with("what's the weather")
+        listener.state_manager.stop()
+
+    def test_collection_held_while_speech_awaits_transcription(self):
+        listener, _ = _create_listener()
+        listener.state_manager.start_collection("remind me to")
+        listener.state_manager._last_voice_time = time.time() - 60
+        listener._utterance_q.put(object())
+
+        with patch.object(listener, "_submit_query") as submit:
+            listener._check_query_timeout()
+
+        submit.assert_not_called()
+        assert listener.state_manager.is_collecting()
+        listener.state_manager.stop()
+
+    def test_max_collection_time_still_applies_while_speech_continues(self):
+        listener, _ = _create_listener()
+        listener.state_manager.start_collection("endless")
+        listener.state_manager._collect_start_time = time.time() - 3600
+        listener.is_speech_active = True
+
+        with patch.object(listener, "_submit_query") as submit:
+            listener._check_query_timeout()
+
+        submit.assert_called_once_with("endless")
+        listener.state_manager.stop()
+
+
+@pytest.mark.unit
+class TestReplyWorker:
+    """Accepted queries reach the reply engine with language and timings."""
+
+    def _run_worker(self, listener, reply="It is sunny."):
+        import threading
+        calls = []
+
+        def fake_reply(db, cfg, _x, query, _memory, language=None):
+            calls.append((query, language))
+            return reply
+
+        listener._reply_thread = threading.Thread(
+            target=listener._reply_worker_loop, daemon=True)
+        listener._reply_thread.start()
+        return calls, fake_reply
+
+    def _stop_worker(self, listener):
+        listener._query_q.put(None)
+        listener._reply_thread.join(5)
+
+    @patch("builtins.print")
+    def test_language_detected_at_submit_time_reaches_reply_engine(self, _print):
+        listener, _ = _create_listener()
+        calls, fake_reply = self._run_worker(listener)
+        with patch("jarvis.reply.engine.run_reply_engine", side_effect=fake_reply):
+            listener._last_detected_language = "hi"
+            listener._submit_query("aaj mausam kaisa hai")
+            listener._last_detected_language = "en"
+            self._stop_worker(listener)
+
+        assert calls == [("aaj mausam kaisa hai", "hi")]
+        listener.state_manager.stop()
+
+    def test_voice_timing_line_reports_each_stage(self):
+        listener, mock_tts = _create_listener()
+        mock_tts.speak.side_effect = lambda *a, first_audio_callback=None, **k: first_audio_callback()
+        listener._utt_timing = {"capture": 0.01, "vad": 0.002, "whisper": 0.3}
+        listener._intent_start = None
+        listener._last_speech_end = __import__("time").perf_counter()
+        listener._accept_query("what's the weather", "jarvis what's the weather")
+
+        calls, fake_reply = self._run_worker(listener)
+        with patch("jarvis.reply.engine.run_reply_engine", side_effect=fake_reply), \
+             patch("builtins.print") as printed:
+            listener._submit_query("what's the weather")
+            self._stop_worker(listener)
+
+        lines = [str(c.args[0]) for c in printed.call_args_list if c.args and "VOICE" in str(c.args[0])]
+        assert len(lines) == 1
+        for stage in ("capture=", "vad=", "whisper=300ms", "collect=", "chat=", "tts_first_audio=", "total="):
+            assert stage in lines[0]
+        listener.state_manager.stop()
+
+
+@pytest.mark.unit
+def test_format_voice_timing_matches_documented_shape():
+    from jarvis.listening.listener import format_voice_timing
+    line = format_voice_timing({
+        "capture": 0.042, "vad": 0.019, "whisper": 0.31, "intent": 0.24,
+        "chat": 0.52, "tts_first_audio": 0.18, "total": 1.27,
+    })
+    assert line == "VOICE capture=42ms vad=19ms whisper=310ms intent=240ms chat=520ms tts_first_audio=180ms total=1.27s"

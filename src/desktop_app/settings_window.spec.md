@@ -170,7 +170,7 @@ These fields are managed elsewhere or are too complex for a simple form:
 - `active_profiles` — list managed by setup wizard
 - `allowlist_bundles` — list of bundle IDs
 - `wake_aliases` — list of strings (complex editing)
-- `stop_commands` / `stop_command_fuzzy_ratio` — list of strings
+- `stop_commands` / `stop_command_fuzzy_ratio` / `interrupt_commands` — list of strings
 - `use_stdin` — developer/CLI flag
 - `voice_debug` — environment variable only
 - `whisper_min_audio_duration` / `whisper_min_word_length` — rarely changed advanced params

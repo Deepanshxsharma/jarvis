@@ -1149,14 +1149,15 @@ class TestLanguagePlumbingEndToEnd:
         assert mock_wiki.call_args.kwargs.get("lang") == "tr"
 
     def test_listener_stores_detected_language_attribute(self):
-        """The listener exposes `_last_detected_language` so `_dispatch_query`
-        can read it — this is the single attribute the reply engine bridge
-        depends on. Guard against it being renamed or removed silently."""
+        """The listener exposes `_last_detected_language` so `_submit_query`
+        can hand it to the reply worker — this is the single attribute the
+        reply engine bridge depends on. Guard against it being renamed or
+        removed silently."""
         from src.jarvis.listening import listener as listener_module
         import inspect
         src = inspect.getsource(listener_module)
-        # One init, at least two assignment sites (MLX + faster-whisper),
-        # and the dispatch call must read it.
+        # One init and at least two assignment sites (MLX + faster-whisper).
+        # Delivery to the reply engine is covered behaviourally in
+        # tests/test_hot_window_input.py::TestReplyWorker.
         assert "self._last_detected_language: Optional[str] = None" in src
         assert src.count("self._last_detected_language = detected") >= 2
-        assert "language=self._last_detected_language" in src
