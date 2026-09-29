@@ -1094,6 +1094,9 @@ class TestSampleRateFallback:
                                     return bool(np.max(np.abs(np.frombuffer(pcm, dtype=np.int16))) > 0)
                             listener._vad = StrictVad()
                             mock_cfg.endpoint_silence_ms = 40
+                            mock_cfg.max_utterance_ms = 12000
+                            mock_cfg.tts_max_utterance_ms = 3000
+                            mock_tts.is_speaking.return_value = False
                             mock_cfg.whisper_min_audio_duration = 0.3
                             listener._check_query_timeout = MagicMock()
                             get_calls = [0]

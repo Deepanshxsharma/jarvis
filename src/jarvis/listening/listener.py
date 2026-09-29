@@ -2246,11 +2246,10 @@ class VoiceListener(threading.Thread):
         max_utt_ms = int(getattr(self.cfg, "max_utterance_ms", 12000))
         tts_max_utt_ms = int(getattr(self.cfg, "tts_max_utterance_ms", 3000))
 
-        pre_roll_max_frames = max(1, int(pre_roll_ms / frame_ms))
-        endpoint_silence_frames = max(1, int(endpoint_silence_ms / frame_ms))
-        # max_utt_frames will be calculated dynamically based on TTS state
-        normal_max_utt_frames = max(1, int(max_utt_ms / frame_ms))
-        tts_max_utt_frames = max(1, int(tts_max_utt_ms / frame_ms))
+        self._pre_roll_max_frames = max(1, int(pre_roll_ms / frame_ms))
+        self._endpoint_silence_frames = max(1, int(endpoint_silence_ms / frame_ms))
+        self._normal_max_utt_frames = max(1, int(max_utt_ms / frame_ms))
+        self._tts_max_utt_frames = max(1, int(tts_max_utt_ms / frame_ms))
 
         debug_log(f"audio params: sample_rate={self._samplerate}, frame_ms={frame_ms}, frame_samples={self._frame_samples}", "voice")
         debug_log(f"VAD: enabled={bool(self._vad is not None)}, aggressiveness={getattr(self.cfg, 'vad_aggressiveness', 2)}", "voice")
@@ -2456,50 +2455,8 @@ class VoiceListener(threading.Thread):
                     if np is None:
                         continue
 
-                    frame_timestamp = time.time()  # Timestamp for this batch of frames
                     for frame in self._audio_frames(item):
-                        # VAD decision
-                        vad_start = _perf_counter()
-                        is_voice = self._is_speech_frame(frame)
-                        self._vad_seconds += _perf_counter() - vad_start
-                        self._speech_frames_seen += int(is_voice)
-
-                        if not self.is_speech_active:
-                            if is_voice:
-                                self.is_speech_active = True
-                                self._vad_seconds = 0.0
-
-                                # Backdate start time by pre-roll duration — the
-                                # actual speech onset was before VAD triggered.
-                                pre_roll_sec = len(self._pre_roll) * frame_ms / 1000.0
-                                utterance_start_time = time.time() - pre_roll_sec
-
-                                # Track utterance timing for echo detection
-                                self.echo_detector.track_utterance_timing(utterance_start_time, 0.0)
-
-                                # Seed with pre-roll
-                                if self._pre_roll:
-                                    self._utterance_frames.extend(list(self._pre_roll))
-                                self._utterance_frames.append(frame.copy())
-                                self._silence_frames = 0
-                            else:
-                                # Maintain pre-roll buffer
-                                self._pre_roll.append(frame.copy())
-                                while len(self._pre_roll) > pre_roll_max_frames:
-                                    try:
-                                        self._pre_roll.popleft()
-                                    except Exception:
-                                        break
-                        else:
-                            if is_voice:
-                                self._utterance_frames.append(frame.copy())
-                                self._silence_frames = 0
-                            else:
-                                self._silence_frames += 1
-                                # Use shorter timeout during TTS for quick stop command detection
-                                current_max_frames = tts_max_utt_frames if (self.tts and self.tts.is_speaking()) else normal_max_utt_frames
-                                if self._silence_frames >= endpoint_silence_frames or len(self._utterance_frames) >= current_max_frames:
-                                    self._end_utterance(forced=self._silence_frames < endpoint_silence_frames)
+                        self._process_capture_frame(frame)
             finally:
                 self._stop_workers()
 
@@ -2528,6 +2485,44 @@ class VoiceListener(threading.Thread):
             self._query_q.put(None)
             self._reply_thread.join(timeout=2)
             self._reply_thread = None
+
+    def _process_capture_frame(self, frame) -> None:
+        """Run VAD on one frame and grow, or end, the current utterance."""
+        vad_start = _perf_counter()
+        is_voice = self._is_speech_frame(frame)
+        self._vad_seconds += _perf_counter() - vad_start
+        self._speech_frames_seen += int(is_voice)
+
+        if not self.is_speech_active:
+            if is_voice:
+                self.is_speech_active = True
+                self._vad_seconds = 0.0
+                # Backdate start time by pre-roll duration — the actual
+                # speech onset was before VAD triggered.
+                pre_roll_sec = len(self._pre_roll) * self._frame_ms / 1000.0
+                self.echo_detector.track_utterance_timing(time.time() - pre_roll_sec, 0.0)
+                self._utterance_frames.extend(self._pre_roll)
+                self._utterance_frames.append(frame.copy())
+                self._silence_frames = 0
+            else:
+                self._pre_roll.append(frame.copy())
+                while len(self._pre_roll) > self._pre_roll_max_frames:
+                    self._pre_roll.popleft()
+            return
+
+        if is_voice:
+            self._utterance_frames.append(frame.copy())
+            self._silence_frames = 0
+        else:
+            self._silence_frames += 1
+        # The length limit applies on every frame: Jarvis's own voice or a
+        # noisy room may never leave a pause. It is shorter during playback
+        # so stop commands are transcribed promptly.
+        speaking = bool(self.tts and self.tts.is_speaking())
+        max_frames = self._tts_max_utt_frames if speaking else self._normal_max_utt_frames
+        at_endpoint = self._silence_frames >= self._endpoint_silence_frames
+        if at_endpoint or len(self._utterance_frames) >= max_frames:
+            self._end_utterance(forced=not at_endpoint)
 
     def _end_utterance(self, forced: bool) -> None:
         """Finish the current utterance at an endpoint or the length limit.

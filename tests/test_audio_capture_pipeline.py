@@ -227,3 +227,51 @@ def test_length_limit_cut_during_playback_does_not_overlap():
     obj._end_utterance(forced=True)
 
     assert obj._utterance_frames == [] and not obj.is_speech_active
+
+
+def _frame_listener(tts_speaking=False):
+    obj, _ = _capture_listener()
+    obj.is_speech_active = False
+    obj._utterance_frames = []
+    obj._silence_frames = 0
+    obj._speech_frames_seen = 0
+    obj._pre_roll_max_frames = 12
+    obj._endpoint_silence_frames = 40
+    obj._normal_max_utt_frames = 600
+    obj._tts_max_utt_frames = 150
+    obj.tts = SimpleNamespace(is_speaking=lambda: tts_speaking)
+    obj._is_speech_frame = lambda frame: True
+    cut = []
+    obj._transcribe_utterance = cut.append
+    return obj, cut
+
+
+def test_continuous_speech_during_playback_is_cut_every_three_seconds():
+    """Jarvis's own voice leaves no pauses; a stop command must not wait for one."""
+    obj, cut = _frame_listener(tts_speaking=True)
+    frame = np.ones(obj._frame_samples, dtype=np.float32) * .1
+    for _ in range(450):  # 9 s of unbroken speech
+        obj._process_capture_frame(frame)
+    assert len(cut) == 3
+    assert all(u.audio.size == obj._frame_samples * 150 for u in cut)
+
+
+def test_unbroken_room_noise_is_cut_at_the_length_limit():
+    obj, cut = _frame_listener()
+    frame = np.ones(obj._frame_samples, dtype=np.float32) * .1
+    for _ in range(601):
+        obj._process_capture_frame(frame)
+    assert len(cut) == 1
+    assert len(obj._utterance_frames) == 51  # 1 s overlap carried + the next frame
+
+
+def test_speech_ends_at_endpoint_silence():
+    obj, cut = _frame_listener()
+    frame = np.ones(obj._frame_samples, dtype=np.float32) * .1
+    for _ in range(50):
+        obj._process_capture_frame(frame)
+    obj._is_speech_frame = lambda frame: False
+    for _ in range(40):
+        obj._process_capture_frame(frame)
+    assert len(cut) == 1
+    assert not obj.is_speech_active and obj._utterance_frames == []

@@ -11,7 +11,8 @@ device's native rate when rejected. Frames always span the configured 10, 20 or
 30 ms at the actual capture rate; unsupported frame durations use 20 ms. Partial
 callback blocks are retained until a complete frame is available and discarded
 on audio-state resets. An utterance ends after `endpoint_silence_ms` of silence or
-at `max_utterance_ms` (`tts_max_utterance_ms` during playback). A length-limit cut
+at `max_utterance_ms` (`tts_max_utterance_ms` during playback), checked on every
+frame because Jarvis's own voice or a noisy room may never leave a pause. A length-limit cut
 outside playback repeats its last second at the start of the next utterance, so a
 wake word spoken at the seam is not split. WebRTC VAD receives a 16 kHz mono PCM copy, including when
 the hardware captures at 44.1 or 48 kHz. Utterances retain native-rate samples
