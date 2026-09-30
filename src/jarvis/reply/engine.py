@@ -82,7 +82,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from ..utils.location import get_location_context_with_timezone
-from ..utils.time_context import format_time_context
+from ..utils.time_context import format_time_context, local_now
 
 if TYPE_CHECKING:
     from ..memory.db import Database
@@ -648,23 +648,35 @@ def _maybe_digest_tool_result(
     return raw_tool_result
 
 
+def _live_location_and_timezone(cfg) -> tuple[str, Optional[str]]:
+    """Return the location line and IANA zone name (either may be empty)."""
+    if not getattr(cfg, 'location_enabled', True):
+        return "Location: Disabled", None
+    return get_location_context_with_timezone(
+        config_ip=getattr(cfg, 'location_ip_address', None),
+        auto_detect=getattr(cfg, 'location_auto_detect', True),
+        resolve_cgnat_public_ip=getattr(cfg, 'location_cgnat_resolve_public_ip', True),
+        location_cache_minutes=getattr(cfg, 'location_cache_minutes', 60),
+    )
+
+
 def _live_time_location_string(cfg) -> str:
     """Return a one-liner describing current local time and location, or ""."""
     try:
-        tz_name: Optional[str] = None
-        if not getattr(cfg, 'location_enabled', True):
-            location_context = "Location: Disabled"
-        else:
-            location_context, tz_name = get_location_context_with_timezone(
-                config_ip=getattr(cfg, 'location_ip_address', None),
-                auto_detect=getattr(cfg, 'location_auto_detect', True),
-                resolve_cgnat_public_ip=getattr(cfg, 'location_cgnat_resolve_public_ip', True),
-                location_cache_minutes=getattr(cfg, 'location_cache_minutes', 60),
-            )
+        location_context, tz_name = _live_location_and_timezone(cfg)
         return f"Current local time: {format_time_context(tz_name)}. {location_context}"
     except Exception as e:
         debug_log(f"live time/location lookup failed: {e}", "memory")
         return ""
+
+
+def _live_local_now(cfg) -> datetime:
+    """Current time in the same zone the live time line shows the model."""
+    try:
+        return local_now(_live_location_and_timezone(cfg)[1])
+    except Exception as e:
+        debug_log(f"live timezone lookup failed, using the system zone: {e}", "memory")
+        return local_now()
 
 
 def _previous_turn_failed_tool_names(recent_messages: list) -> list[str]:
@@ -1298,13 +1310,22 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                         timeout_sec=float(getattr(cfg, 'llm_tools_timeout_sec', 8.0)),
                         thinking=getattr(cfg, 'llm_thinking_enabled', False),
                         context_hint=context_hint,
+                        now_local=_live_local_now(cfg),
                     )
                 if dialogue_memory and hasattr(dialogue_memory, "hot_cache_put"):
                     dialogue_memory.hot_cache_put(_extractor_cache_key, search_params)
+                    debug_log(
+                        "search params persistence: kept in the conversation cache only; "
+                        "long-term memory is written by the diary summariser and graph extraction",
+                        "memory",
+                    )
             keywords = search_params.get('keywords', [])
             questions = search_params.get('questions', [])
             if keywords:
-                print(f"  🔍 Memory search: {', '.join(keywords)}", flush=True)
+                # Keywords are derived from what the user said, so the normal
+                # log only shows how many; the words themselves are debug-only.
+                _window = " in a time window" if search_params.get("from") else ""
+                print(f"  🔍 Memory search: {len(keywords)} keyword(s){_window}", flush=True)
                 debug_log(f"extracted keywords: {keywords}", "memory")
             if questions:
                 debug_log(f"implicit questions: {questions}", "memory")

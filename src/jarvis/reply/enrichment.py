@@ -29,147 +29,309 @@ def call_llm_direct(*, cfg, chat_model, system_prompt, user_content,
 
 # ── Memory search-parameter extraction ─────────────────────────────────────
 
-# Room for 5 keywords, a couple of implicit questions, a quoted time phrase
-# and two ISO timestamps. The old cap of 50 tokens cut the JSON off mid-way
-# whenever the model emitted questions or a time range, so every such
-# extraction was discarded as unparseable.
-_SEARCH_PARAMS_MAX_TOKENS = 256
 _SEARCH_PARAMS_MAX_KEYWORDS = 8
 _SEARCH_PARAMS_MAX_QUESTIONS = 5
+_KEYWORD_MAX_CHARS = 48
+_QUESTION_MAX_CHARS = 120
+_TIME_PHRASE_MAX_CHARS = 60
+# Time expressions are short ("the past two weeks", "on 3 June 2025"). A
+# longer quote, or one that is the whole query, is the model copying the
+# request itself into the time field.
+_TIME_PHRASE_MAX_WORDS = 6
 
-# Largest positive UTC offset in use (UTC+14). A range the model resolved
-# from local time can legitimately start this far ahead of UTC "now".
-_MAX_LOCAL_AHEAD_OF_UTC = timedelta(hours=14)
+_TIME_UNITS = ("day", "week", "month", "year")
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+# The schema bounds every list and string, so the largest valid answer has a
+# known size. Budget it at a pessimistic 3 characters per token plus JSON
+# punctuation so valid output can never be cut off (the old fixed cap of 50
+# tokens truncated answers mid-timestamp and every retry truncated again).
+_TIME_OBJECT_MAX_CHARS = _TIME_PHRASE_MAX_CHARS + 120
+_SEARCH_PARAMS_MAX_TOKENS = (
+    _SEARCH_PARAMS_MAX_KEYWORDS * (_KEYWORD_MAX_CHARS + 4)
+    + _SEARCH_PARAMS_MAX_QUESTIONS * (_QUESTION_MAX_CHARS + 4)
+    + _TIME_OBJECT_MAX_CHARS
+    + 60
+) // 3
+
+# Resolved periods further than this from now are treated as a misreading.
+_MAX_TIME_DISTANCE = timedelta(days=366 * 30)
 
 SEARCH_PARAMS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "keywords": {"type": "array", "items": {"type": "string"}},
-        "questions": {"type": "array", "items": {"type": "string"}},
-        "time_phrase": {"type": "string"},
-        "from": {"type": "string"},
-        "to": {"type": "string"},
+        "keywords": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": _KEYWORD_MAX_CHARS},
+            "maxItems": _SEARCH_PARAMS_MAX_KEYWORDS,
+        },
+        "questions": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": _QUESTION_MAX_CHARS},
+            "maxItems": _SEARCH_PARAMS_MAX_QUESTIONS,
+        },
+        "time": {
+            "type": "object",
+            "properties": {
+                "phrase": {"type": "string", "maxLength": _TIME_PHRASE_MAX_CHARS},
+                "unit": {"enum": list(_TIME_UNITS + _WEEKDAYS)},
+                "offset": {"type": "integer"},
+                "until_now": {"type": "boolean"},
+                "date": {"type": "string", "maxLength": 10},
+            },
+            "required": ["phrase", "unit"],
+        },
     },
     "required": ["keywords"],
 }
 
 
-def _clean_string_list(value: Any, limit: int) -> list[str]:
+class _InvalidParams(ValueError):
+    """The response does not satisfy SEARCH_PARAMS_SCHEMA."""
+
+
+def _string_list(raw: dict, key: str, limit: int, max_chars: int) -> list[str]:
+    value = raw.get(key, [])
+    if not isinstance(value, list):
+        raise _InvalidParams(f"{key} is not a list")
     out: list[str] = []
     seen: set[str] = set()
-    for item in value if isinstance(value, list) else []:
+    for item in value:
         if not isinstance(item, str):
-            continue
+            raise _InvalidParams(f"{key} contains a non-string item")
         text = item.strip()
-        key = text.casefold()
-        if text and key not in seen:
-            seen.add(key)
-            out.append(text)
+        key_cf = text.casefold()
+        if not text or len(text) > max_chars or key_cf in seen:
+            continue
+        seen.add(key_cf)
+        out.append(text)
         if len(out) >= limit:
             break
     return out
-
-
-def _parse_utc(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _format_utc(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _normalise_for_match(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
-def _validated_time_range(raw: dict, query: str, now: datetime) -> dict:
-    """Return ``{"from": ..., "to": ...}`` (either may be absent) only when the
-    range is grounded in the query and semantically valid; otherwise ``{}``.
+def _format_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    Grounding is language-agnostic: the model must quote the time expression
-    it resolved (``time_phrase``) and that quote must occur in the query. A
-    range with no quote, or a quote the query does not contain, is an
-    invented range and is dropped so the diary search runs unfiltered."""
-    has_from = "from" in raw
-    has_to = "to" in raw
-    if not (has_from or has_to):
+
+def _local_midnight(day, tz) -> datetime:
+    return datetime(day.year, day.month, day.day, tzinfo=tz)
+
+
+def _shift_months(year: int, month: int, delta: int) -> tuple[int, int]:
+    index = year * 12 + (month - 1) + delta
+    return index // 12, index % 12 + 1
+
+
+def _period_bounds(unit: str, offset: int, anchor_date, today) -> tuple[Any, Any]:
+    """Return the first and last calendar day of the period described by
+    ``unit``/``offset`` (relative to ``today``) or containing ``anchor_date``."""
+    if unit in _WEEKDAYS:
+        target = _WEEKDAYS.index(unit)
+        this_week = today + timedelta(days=target - today.weekday())
+        if offset < 0:
+            day = this_week if this_week < today else this_week - timedelta(days=7)
+            day -= timedelta(days=7 * (-offset - 1))
+        elif offset > 0:
+            day = this_week if this_week > today else this_week + timedelta(days=7)
+            day += timedelta(days=7 * (offset - 1))
+        else:
+            day = this_week
+        return day, day
+
+    base = anchor_date or today
+    if unit == "day":
+        day = base + timedelta(days=offset)
+        return day, day
+    if unit == "week":
+        monday = base - timedelta(days=base.weekday()) + timedelta(days=7 * offset)
+        return monday, monday + timedelta(days=6)
+    if unit == "month":
+        year, month = _shift_months(base.year, base.month, offset)
+        first = base.replace(year=year, month=month, day=1)
+        next_year, next_month = _shift_months(year, month, 1)
+        return first, first.replace(year=next_year, month=next_month) - timedelta(days=1)
+    first = base.replace(year=base.year + offset, month=1, day=1)
+    return first, first.replace(month=12, day=31)
+
+
+def resolve_time_range(raw_time: Any, query: str, now_local: datetime) -> dict:
+    """Turn the model's time classification into a diary search window.
+
+    Returns ``{"from": ..., "to": ...}`` as UTC timestamps, or ``{}`` when the
+    query names no usable time. The model only quotes the time expression and
+    classifies it (unit, offset, optional explicit date); the calendar
+    arithmetic happens here in the user's local timezone, because small
+    models resolve "tomorrow" or "last Monday" to the wrong day.
+
+    A period is dropped when its quote does not occur in the query (an
+    invented time), when a field is malformed or contradictory, when it lies
+    implausibly far away, or when it has not started yet: the diary only
+    holds past conversations, so a future window would hide every entry.
+    """
+    if raw_time is None:
+        return {}
+    try:
+        return _resolve_time_range(raw_time, query, now_local)
+    except (_InvalidParams, ValueError, OverflowError) as exc:
+        debug_log(f"search params time: dropped ({exc})", "memory")
         return {}
 
-    phrase = raw.get("time_phrase")
+
+def _resolve_time_range(raw_time: Any, query: str, now_local: datetime) -> dict:
+    if not isinstance(raw_time, dict):
+        raise _InvalidParams("time is not an object")
+
+    phrase = raw_time.get("phrase")
     phrase_norm = _normalise_for_match(phrase) if isinstance(phrase, str) else ""
     if len(phrase_norm) < 2 or phrase_norm not in _normalise_for_match(query):
+        raise _InvalidParams(f"quote {phrase!r} does not occur in the query")
+    phrase_words = re.findall(r"\w+", phrase_norm)
+    query_words = re.findall(r"\w+", query.casefold())
+    if len(phrase_words) > _TIME_PHRASE_MAX_WORDS or (
+        len(query_words) > 2 and phrase_words == query_words
+    ):
+        raise _InvalidParams(f"quote {phrase!r} is not a time expression")
+
+    unit = raw_time.get("unit")
+    if unit not in _TIME_UNITS and unit not in _WEEKDAYS:
+        raise _InvalidParams(f"unknown unit {unit!r}")
+
+    offset = raw_time.get("offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise _InvalidParams(f"offset {offset!r} is not an integer")
+
+    until_now = raw_time.get("until_now", False)
+    if not isinstance(until_now, bool):
+        raise _InvalidParams(f"until_now {until_now!r} is not a boolean")
+
+    anchor_date = None
+    raw_date = raw_time.get("date")
+    if raw_date not in (None, ""):
+        if unit in _WEEKDAYS or offset:
+            raise _InvalidParams("an explicit date cannot be combined with a weekday or offset")
+        if not isinstance(raw_date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
+            raise _InvalidParams(f"date {raw_date!r} is not YYYY-MM-DD")
+        anchor_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+
+    tz = now_local.tzinfo or timezone.utc
+    first_day, last_day = _period_bounds(unit, offset, anchor_date, now_local.date())
+    start = _local_midnight(first_day, tz)
+    end = _local_midnight(last_day + timedelta(days=1), tz) - timedelta(seconds=1)
+
+    if abs(start - now_local) > _MAX_TIME_DISTANCE:
+        raise _InvalidParams(f"period starting {first_day} is implausibly far from now")
+    if start > now_local:
         debug_log(
-            f"search params: dropped time range with ungrounded time_phrase={phrase!r}",
+            f"search params time: {phrase!r} resolves to {first_day}..{last_day}, "
+            "which has not started; not used as a diary filter",
             "memory",
         )
         return {}
+    if until_now:
+        end = now_local
 
-    from_dt = _parse_utc(raw.get("from")) if has_from else None
-    to_dt = _parse_utc(raw.get("to")) if has_to else None
-    if (has_from and from_dt is None) or (has_to and to_dt is None):
-        debug_log("search params: dropped time range with unparseable timestamp", "memory")
-        return {}
-    if from_dt and to_dt and from_dt > to_dt:
-        debug_log("search params: dropped time range with from after to", "memory")
-        return {}
-    if from_dt and from_dt > now + _MAX_LOCAL_AHEAD_OF_UTC:
-        # Memory holds only past conversations; a range starting in the
-        # future can match nothing and would hide every real entry.
-        debug_log("search params: dropped time range starting in the future", "memory")
-        return {}
+    resolved = {"from": _format_utc(start), "to": _format_utc(end)}
+    debug_log(f"search params time: {phrase!r} resolved to {resolved}", "memory")
+    return resolved
 
-    out: dict[str, str] = {}
-    if from_dt:
-        out["from"] = _format_utc(from_dt)
-    if to_dt:
-        out["to"] = _format_utc(to_dt)
-    return out
+
+def _loads_json_object(response: str) -> Any:
+    text = response.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    return json.loads(text)
 
 
 def parse_search_params(response: Optional[str], query: str,
-                        now: Optional[datetime] = None) -> Optional[dict]:
-    """Parse and validate an extractor response.
+                        now_local: Optional[datetime] = None) -> Optional[dict]:
+    """Validate an extractor response against SEARCH_PARAMS_SCHEMA.
 
-    Returns the sanitised params dict, or ``None`` when the response is
-    missing, truncated, not JSON, or violates the schema (``keywords`` must
-    be a list). Invalid optional fields are dropped rather than failing the
-    whole extraction."""
+    Returns ``{"keywords", "questions"}`` plus ``from``/``to`` when the query
+    names a usable time, or ``None`` when the response is missing, truncated,
+    not a JSON object, or has a field of the wrong type. An invalid time
+    reference only drops the time window; the keywords still stand.
+    """
     if not response or not response.strip():
+        debug_log("search params validation: empty response", "memory")
         return None
-    text = response.strip()
     try:
-        raw = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            return None
-        try:
-            raw = json.loads(match.group())
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(raw, dict) or not isinstance(raw.get("keywords"), list):
+        raw = _loads_json_object(response)
+        if not isinstance(raw, dict):
+            raise _InvalidParams("response is not a JSON object")
+        if "keywords" not in raw:
+            raise _InvalidParams("keywords is missing")
+        keywords = _string_list(raw, "keywords", _SEARCH_PARAMS_MAX_KEYWORDS, _KEYWORD_MAX_CHARS)
+        questions = _string_list(raw, "questions", _SEARCH_PARAMS_MAX_QUESTIONS, _QUESTION_MAX_CHARS)
+        raw_time = raw.get("time")
+        if raw_time is not None and not isinstance(raw_time, dict):
+            raise _InvalidParams("time is not an object")
+    except (json.JSONDecodeError, _InvalidParams) as exc:
+        debug_log(f"search params validation: rejected ({exc})", "memory")
         return None
+    debug_log("search params validation: ok", "memory")
 
-    params: dict[str, Any] = {
-        "keywords": _clean_string_list(raw["keywords"], _SEARCH_PARAMS_MAX_KEYWORDS),
-        "questions": _clean_string_list(raw.get("questions"), _SEARCH_PARAMS_MAX_QUESTIONS),
-    }
-    params.update(_validated_time_range(raw, query, now or datetime.now(timezone.utc)))
+    time_range = resolve_time_range(raw_time, query, now_local or datetime.now(timezone.utc))
+    if isinstance(raw_time, dict) and isinstance(raw_time.get("phrase"), str):
+        phrase_norm = _normalise_for_match(raw_time["phrase"])
+        if phrase_norm:
+            keywords = [k for k in keywords if _normalise_for_match(k) not in phrase_norm]
+
+    params: dict[str, Any] = {"keywords": keywords, "questions": questions}
+    params.update(time_range)
     return params
 
 
+_SEARCH_PARAMS_SYSTEM_PROMPT = """Extract search parameters from the user's query for conversation memory search.
+
+Extract:
+1. CONTENT KEYWORDS: 3-5 relevant topics/subjects (ignore time words). Include general, high-level category tags that would be suitable for blog-style tagging when applicable (e.g., "cooking", "fitness", "travel", "finance").
+2. TIME: Only if the query itself names a time, describe it in "time". Do not work out dates yourself; the assistant does the calendar arithmetic from your description.
+3. QUESTIONS: What implicit personal questions does this query need answered from stored knowledge about the user? These are things the assistant would need to know about the user to give a personalised answer. Omit if the query needs no personal context, OR if the answer is already visible in the ALREADY IN CONTEXT block of the user message.
+
+The user message may include an ALREADY IN CONTEXT block listing facts the assistant can already see (current time/location, recent dialogue). When present, do NOT generate questions whose answers are already there — those facts do not need to be pulled from long-term memory.
+
+Respond ONLY with JSON in this format:
+{"keywords": ["keyword1", "keyword2"], "questions": ["what are the user's food preferences?"], "time": {"phrase": "yesterday", "unit": "day", "offset": -1}}
+
+Rules:
+- keywords: content topics only (no time words like "yesterday", "today"). Include both specific terms and general category tags when applicable (e.g., for recipes or meal prep you could include "cooking" and "nutrition").
+- prefer concise noun phrases; lowercase; no punctuation; deduplicate similar terms
+- questions: short personal questions about the user that this query implies. Omit for factual/utility queries (time, maths, definitions) that need no personal context. Also omit any question whose answer is already present in the ALREADY IN CONTEXT block (e.g. do not ask "where is the user located?" when a location is shown there, and do not ask about topics the user just mentioned in the recent dialogue).
+- time.phrase: only the words of the query that express the time (e.g. "yesterday", "on Monday", "last 3 days"), copied word for word. Never the whole query or its other words, and never text from the context block or the examples.
+- time.unit: "day", "week", "month" or "year" for a calendar period; the weekday name ("monday" ... "sunday") for a named day of the week.
+- time.offset: how many whole periods away from the current one, negative for the past and positive for the future: 0 = the current one (today, this week), -1 = the previous one (yesterday, last week), 1 = the next one (tomorrow, next week), -3 = three periods ago. For a weekday: -1 = the most recent one before today, 1 = the coming one after today, 0 = the one in the current week.
+- time.until_now: true only when the query means from that point up to now (e.g. "in the past 5 days" is unit "day", offset -5, until_now true).
+- time.date: only when the query names a calendar date, month or year, as YYYY-MM-DD with no offset: a day number with a month is that exact day with unit "day"; a month alone is its first day with unit "month"; a year alone is 1 January with unit "year". Use the year of the current date unless the query names one.
+- omit "time" if the query names no time, or names it only vaguely (recently, a while ago, some time); never guess one.
+
+Examples:
+"what did we discuss about the warhammer project?" → {"keywords": ["warhammer", "project", "figures", "gaming", "tabletop"]}
+"what did I eat yesterday?" → {"keywords": ["eat", "food", "cooking", "nutrition"], "time": {"phrase": "yesterday", "unit": "day", "offset": -1}}
+"remember that password I mentioned today?" → {"keywords": ["password", "accounts", "security", "credentials"], "time": {"phrase": "today", "unit": "day", "offset": 0}}
+"what did I tell you on Friday about the car?" → {"keywords": ["car", "vehicle", "transport"], "time": {"phrase": "Friday", "unit": "friday", "offset": -1}}
+"any notes on gardening from the past two weeks?" → {"keywords": ["gardening", "plants", "garden"], "time": {"phrase": "the past two weeks", "unit": "week", "offset": -2, "until_now": true}}
+"I have a dentist appointment next Thursday" → {"keywords": ["dentist", "appointment", "health"], "time": {"phrase": "next Thursday", "unit": "thursday", "offset": 1}}
+"what did we agree about the lease on 3 June 2025?" → {"keywords": ["lease", "housing", "rent", "agreement"], "time": {"phrase": "3 June 2025", "unit": "day", "date": "2025-06-03"}}
+"what news might interest me?" → {"keywords": ["interests", "hobbies", "preferences", "likes", "passionate"], "questions": ["what topics interest the user?", "what are the user's hobbies?"]}
+"news of interest to me" / "news that would interest me" / "news interesting for me" / "recall my interests and search for news on them" → {"keywords": ["interests", "hobbies", "preferences", "likes", "passionate"], "questions": ["what topics interest the user?", "what are the user's hobbies?"]}
+"recommend a restaurant I'd enjoy" (no location in context) → {"keywords": ["food preferences", "restaurants", "cuisine", "dining", "favorites"], "questions": ["what cuisine does the user like?", "where is the user located?"]}
+"recommend a restaurant I'd enjoy" (location already in context) → {"keywords": ["food preferences", "restaurants", "cuisine", "dining", "favorites"], "questions": ["what cuisine does the user like?"]}
+"suggest a movie for me" → {"keywords": ["movies", "films", "entertainment", "preferences", "genres"], "questions": ["what film genres does the user enjoy?", "what movies has the user watched recently?"]}
+"what time is it?" → {"keywords": []}
+"""
+
+
 def extract_search_params_for_memory(query: str, cfg, chat_model: str,
-                                   timeout_sec: float = 8.0,
-                                   thinking: bool = False,
-                                   context_hint: Optional[str] = None) -> dict:
+                                     timeout_sec: float = 8.0,
+                                     thinking: bool = False,
+                                     context_hint: Optional[str] = None,
+                                     now_local: Optional[datetime] = None) -> dict:
     """
     Extract search keywords and time parameters for memory recall.
 
@@ -178,7 +340,13 @@ def extract_search_params_for_memory(query: str, cfg, chat_model: str,
     memory). When provided, the extractor is told not to generate questions
     whose answers are already available there — no point pulling those from
     long-term memory. When absent, the extractor gets a UTC timestamp fallback
-    so it can still resolve relative time expressions.
+    so it can still name explicit dates.
+
+    ``now_local`` is the current time in the user's timezone, used to turn the
+    model's time description into a window; UTC is assumed when absent.
+
+    Returns the validated params, or ``{}`` when no usable answer arrives
+    within two identical attempts.
     """
     if not (chat_model or "").strip():
         # Mirror the planner/evaluator gate: no model configured ⇒ skip the
@@ -188,6 +356,7 @@ def extract_search_params_for_memory(query: str, cfg, chat_model: str,
         # except below.
         debug_log("search parameter extraction skipped: no chat model configured", "memory")
         return {}
+    now_local = now_local or datetime.now(timezone.utc)
     try:
         if context_hint and context_hint.strip():
             hint_block = (
@@ -197,54 +366,23 @@ def extract_search_params_for_memory(query: str, cfg, chat_model: str,
                 f"{context_hint.strip()}"
             )
         else:
-            now = datetime.now(timezone.utc)
-            hint_block = f"Current date/time: {now.strftime('%A, %Y-%m-%d %H:%M UTC')}"
+            hint_block = f"Current date/time: {now_local.strftime('%A, %Y-%m-%d %H:%M %Z').strip()}"
 
-        system_prompt = """Extract search parameters from the user's query for conversation memory search.
-
-Extract:
-1. CONTENT KEYWORDS: 3-5 relevant topics/subjects (ignore time words). Include general, high-level category tags that would be suitable for blog-style tagging when applicable (e.g., "cooking", "fitness", "travel", "finance").
-2. TIME RANGE: Only if the query itself names a time, copy that exact time expression from the query into time_phrase and convert it to exact timestamps
-3. QUESTIONS: What implicit personal questions does this query need answered from stored knowledge about the user? These are things the assistant would need to know about the user to give a personalised answer. Omit if the query needs no personal context, OR if the answer is already visible in the ALREADY IN CONTEXT block of the user message.
-
-The user message may include an ALREADY IN CONTEXT block listing facts the assistant can already see (current time/location, recent dialogue). When present, do NOT generate questions whose answers are already there — those facts do not need to be pulled from long-term memory.
-
-Respond ONLY with JSON in this format:
-{"keywords": ["keyword1", "keyword2"], "questions": ["what are the user's food preferences?"], "time_phrase": "yesterday", "from": "2025-08-21T00:00:00Z", "to": "2025-08-21T23:59:59Z"}
-
-Rules:
-- keywords: content topics only (no time words like "yesterday", "today"). Include both specific terms and general category tags when applicable (e.g., for recipes or meal prep you could include "cooking" and "nutrition").
-- prefer concise noun phrases; lowercase; no punctuation; deduplicate similar terms
-- questions: short personal questions about the user that this query implies. Omit for factual/utility queries (time, maths, definitions) that need no personal context. Also omit any question whose answer is already present in the ALREADY IN CONTEXT block (e.g. do not ask "where is the user located?" when a location is shown there, and do not ask about topics the user just mentioned in the recent dialogue).
-- time_phrase: the time expression copied word for word from the query (e.g. "yesterday", "last week"). Never take it from the context block or the examples.
-- from/to: only together with time_phrase, converted to exact UTC timestamps relative to the current date in the user message
-- omit time_phrase, from and to if the query names no time
-
-Examples:
-"what did we discuss about the warhammer project?" → {"keywords": ["warhammer", "project", "figures", "gaming", "tabletop"]}
-"what did I eat yesterday?" → {"keywords": ["eat", "food", "cooking", "nutrition"], "time_phrase": "yesterday", "from": "2025-08-21T00:00:00Z", "to": "2025-08-21T23:59:59Z"}
-"remember that password I mentioned today?" → {"keywords": ["password", "accounts", "security", "credentials"], "time_phrase": "today", "from": "2025-08-22T00:00:00Z", "to": "2025-08-22T23:59:59Z"}
-"what news might interest me?" → {"keywords": ["interests", "hobbies", "preferences", "likes", "passionate"], "questions": ["what topics interest the user?", "what are the user's hobbies?"]}
-"news of interest to me" / "news that would interest me" / "news interesting for me" / "recall my interests and search for news on them" → {"keywords": ["interests", "hobbies", "preferences", "likes", "passionate"], "questions": ["what topics interest the user?", "what are the user's hobbies?"]}
-"recommend a restaurant I'd enjoy" (no location in context) → {"keywords": ["food preferences", "restaurants", "cuisine", "dining", "favorites"], "questions": ["what cuisine does the user like?", "where is the user located?"]}
-"recommend a restaurant I'd enjoy" (location already in context) → {"keywords": ["food preferences", "restaurants", "cuisine", "dining", "favorites"], "questions": ["what cuisine does the user like?"]}
-"suggest a movie for me" → {"keywords": ["movies", "films", "entertainment", "preferences", "genres"], "questions": ["what film genres does the user enjoy?", "what movies has the user watched recently?"]}
-"what time is it?" → {"keywords": []}
-"""
-
-        # Per-call data (the hint or the UTC anchor) rides in the user message
-        # so the system prompt above stays byte-static across calls — the
-        # server's KV/prefix cache can then reuse it for every extractor call.
+        # Per-call data (the hint or the time anchor) rides in the user message
+        # so the system prompt stays byte-static across calls — the server's
+        # KV/prefix cache can then reuse it for every extractor call.
         user_content = f"Extract search parameters from: {query}\n\n{hint_block}"
+        debug_log(
+            f"search params input: query={query!r} context_hint={'yes' if context_hint else 'no'} "
+            f"now_local={now_local.isoformat(timespec='minutes')}",
+            "memory",
+        )
 
-        # Try up to 2 attempts
-        attempts = 0
-        while attempts < 2:
-            attempts += 1
+        for attempt in (1, 2):
             response = call_llm_direct(
                 cfg=cfg,
                 chat_model=chat_model,
-                system_prompt=system_prompt,
+                system_prompt=_SEARCH_PARAMS_SYSTEM_PROMPT,
                 user_content=user_content,
                 timeout_sec=timeout_sec,
                 thinking=thinking,
@@ -252,17 +390,18 @@ Examples:
                 max_tokens=_SEARCH_PARAMS_MAX_TOKENS,
                 json_schema=SEARCH_PARAMS_SCHEMA,
             )
-
-            params = parse_search_params(response, query)
+            debug_log(f"search params raw (attempt {attempt}): {response!r}", "memory")
+            params = parse_search_params(response, query, now_local)
             if params is not None:
+                debug_log(f"search params result: {params}", "memory")
                 return params
-
-            if attempts == 1:
-                debug_log("search parameter extraction: first attempt returned no usable result, retrying", "memory")
+            if attempt == 1:
+                debug_log("search params: no valid answer, retrying once with the same request", "memory")
 
     except Exception as e:
         debug_log(f"search parameter extraction failed: {e}", "memory")
 
+    debug_log("search params result: {} (no valid answer after 2 attempts)", "memory")
     return {}
 
 

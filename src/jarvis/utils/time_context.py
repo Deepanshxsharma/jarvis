@@ -18,12 +18,12 @@ _UTC_FORMAT = "%A, %B %d, %Y at %H:%M UTC"
 _LOCAL_FORMAT = "%A, %B %d, %Y at %H:%M %Z"
 
 
-def format_time_context(
+def local_now(
     tz_name: Optional[str] = None,
     *,
     now_utc: Optional[datetime] = None,
-) -> str:
-    """Return a human-readable string describing the current time.
+) -> datetime:
+    """Return the current instant as an aware datetime in the user's zone.
 
     Resolution order:
     1. ``tz_name`` via ``zoneinfo`` (when GeoIP exposes an IANA zone).
@@ -36,15 +36,28 @@ def format_time_context(
         try:
             local = now.astimezone(ZoneInfo(tz_name))
             if local.tzname():
-                return local.strftime(_LOCAL_FORMAT)
+                return local
         except (ZoneInfoNotFoundError, KeyError, ValueError):
             pass
 
     try:
         system_local = now.astimezone()
         if system_local.tzname():
-            return system_local.strftime(_LOCAL_FORMAT)
+            return system_local
     except (ValueError, OSError):
         pass
 
-    return now.strftime(_UTC_FORMAT)
+    return now.astimezone(timezone.utc)
+
+
+def format_time_context(
+    tz_name: Optional[str] = None,
+    *,
+    now_utc: Optional[datetime] = None,
+) -> str:
+    """Return a human-readable string describing the current time, in the
+    zone chosen by :func:`local_now`."""
+    local = local_now(tz_name, now_utc=now_utc)
+    if local.tzinfo is timezone.utc:
+        return local.strftime(_UTC_FORMAT)
+    return local.strftime(_LOCAL_FORMAT)
