@@ -9,6 +9,8 @@ Voice-first, private by default, and free to run: speech recognition, language m
 </p>
 
 > This repository is a customised fork of [isair/jarvis](https://github.com/isair/jarvis) by Baris Sencan. Most of the application is upstream's work; this fork adds tuning and fixes for M4-class MacBooks. See [Upstream](#upstream) and [License](#license).
+>
+> **Status: development checkpoint (`m4-checkpoint-1`), not a stable release.** It is usable day to day on the machine it was tuned on, but it is not production-ready. See [Project status and known limitations](#project-status-and-known-limitations).
 
 ## Overview
 
@@ -241,7 +243,20 @@ python -m pytest -q tests                  # unit tests, no models needed
 python -m pytest evals -m eval             # behaviour evaluations against a running Ollama
 ```
 
-The unit suite passes on this fork. The live evaluations run the real model and are not all green: the most recent full run had 50 passed, 7 failed and 4 expected failures with `gemma4:e2b`. The failures are in memory keyword extraction, grounding open-ended replies in stored facts, and choosing new tools after a topic change. Their root causes are identified and being fixed. See [EVALS.md](EVALS.md) for the evaluation design.
+The unit suite passes on this fork (2569 tests at `m4-checkpoint-1`). The live evaluations run the real model and are not all green: the most recent full run had 52 passed, 4 failed and 5 expected failures with `gemma4:e2b`. The four failures are described in [Project status and known limitations](#project-status-and-known-limitations). See [EVALS.md](EVALS.md) for the evaluation design.
+
+## Project status and known limitations
+
+`m4-checkpoint-1` is a development checkpoint: the M4 tuning, memory grounding and routing work validated so far, tagged so later changes can be compared against it. It is not a stable release, no binaries are published for it, and the upstream release workflows are disabled in this repository.
+
+Known limitations at this checkpoint:
+
+- **Unknown film lookup ("Tell me about the movie Possessor")**: the planner, which runs at temperature 0, plans a `fetchWebPage` step with a search phrase instead of a URL. The fetch fails and the reply is answered from the model's own knowledge instead of a web search. The matching evaluation fails every time.
+- **Store opening hours after a weather question**: asking how long a shop is open straight after a weather reply is still routed to the weather tool instead of a web search.
+- **"Say something" grounding evaluation**: it depends on a fake memory store in the evaluation harness that cannot serve stored facts, so it fails there even though grounding in stored facts works against a real memory database.
+- **Live weather evaluation**: it depends on the MaxMind GeoLite2 fixture installed on the test machine, so its result varies with that fixture. The small model can also state a temperature it never looked up.
+- **Qt tests on an iCloud-synced folder**: when the repository lives on an iCloud-synced Desktop, macOS marks files in `.venv` as hidden, Qt stops finding its platform plugins, and Qt tests fail at random. Keep the checkout outside iCloud-synced folders.
+- **Residual nondeterminism**: routing and planning calls run at temperature 0, but Ollama's prompt cache can still flip close decisions, and the chat model samples at its default temperature, so some live evaluations pass on some runs and not others.
 
 ## Building the macOS App
 
