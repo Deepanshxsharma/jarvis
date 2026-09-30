@@ -248,8 +248,17 @@ class MockConfig:
     # Provider-aware fields (for LM Studio, OpenAI-compatible, etc.)
     llm_provider: str = ""
     llm_base_url: str = ""
-    llm_chat_model: str = ""
+    _llm_chat_model: str = ""
     embedding_model: Optional[str] = None
+
+    @property
+    def llm_chat_model(self) -> str:
+        """Like the config loader, an unset chat model means ``ollama_chat_model``."""
+        return self._llm_chat_model or self.ollama_chat_model
+
+    @llm_chat_model.setter
+    def llm_chat_model(self, value: str) -> None:
+        self._llm_chat_model = value
 
     def __post_init__(self):
         """Auto-configure provider from EVAL_JUDGE_BASE_URL when set."""
@@ -484,7 +493,9 @@ def call_judge_llm(system_prompt: str, user_prompt: str, timeout_sec: float = 12
         "stream": False,
     }
 
-    ollama_payload = {**openai_payload, "options": {"num_ctx": 4096}}
+    # Same context size as the Ollama backend pins, so the judge reuses the
+    # loaded runner instead of making Ollama load a second one.
+    ollama_payload = {**openai_payload, "options": {"num_ctx": 8192}}
 
     try:
         if _is_ollama():

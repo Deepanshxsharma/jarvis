@@ -33,6 +33,7 @@ def _cfg():
     return SimpleNamespace(
         ollama_base_url=JUDGE_BASE_URL,
         ollama_chat_model=JUDGE_MODEL,
+        llm_chat_model=JUDGE_MODEL,
         fast_model="",
         planner_enabled=True,
         planner_timeout_sec=20.0,

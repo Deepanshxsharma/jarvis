@@ -200,7 +200,7 @@ class TestContextUtilization:
         mock_tool_run = create_mock_tool_run(capture, {"webSearch": MOCK_WEATHER_SEARCH})
 
         call_count = 0
-        def mock_chat(base_url, chat_model, messages, timeout_sec, extra_options=None, tools=None, **kwargs):
+        def mock_chat(cfg, messages, timeout_sec=30.0, extra_options=None, tools=None, **kwargs):
             nonlocal call_count
             call_count += 1
 
@@ -254,7 +254,7 @@ class TestToolUsage:
         })
 
         call_count = 0
-        def mock_chat(base_url, chat_model, messages, timeout_sec, extra_options=None, tools=None, **kwargs):
+        def mock_chat(cfg, messages, timeout_sec=30.0, extra_options=None, tools=None, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -291,7 +291,7 @@ class TestToolUsage:
         })
 
         call_count = 0
-        def mock_chat(base_url, chat_model, messages, timeout_sec, extra_options=None, tools=None, **kwargs):
+        def mock_chat(cfg, messages, timeout_sec=30.0, extra_options=None, tools=None, **kwargs):
             nonlocal call_count
             call_count += 1
 
@@ -355,7 +355,7 @@ class TestMultiStepReasoning:
         })
 
         call_count = 0
-        def mock_chat(base_url, chat_model, messages, timeout_sec, extra_options=None, tools=None, **kwargs):
+        def mock_chat(cfg, messages, timeout_sec=30.0, extra_options=None, tools=None, **kwargs):
             nonlocal call_count
             call_count += 1
 
@@ -433,8 +433,8 @@ class TestMemoryEnrichment:
 
         result = extract_search_params_for_memory(
             query=query,
-            ollama_base_url=mock_config.ollama_base_url,
-            ollama_chat_model=mock_config.ollama_chat_model,
+            cfg=mock_config,
+            chat_model=mock_config.ollama_chat_model,
             timeout_sec=15.0
         )
 
@@ -479,8 +479,8 @@ class TestMemoryEnrichment:
 
         result = extract_search_params_for_memory(
             query="recommend a restaurant I'd enjoy",
-            ollama_base_url=mock_config.ollama_base_url,
-            ollama_chat_model=mock_config.ollama_chat_model,
+            cfg=mock_config,
+            chat_model=mock_config.ollama_chat_model,
             timeout_sec=15.0,
             context_hint=context_hint,
         )
@@ -519,7 +519,7 @@ class TestMemoryEnrichment:
 
         captured_messages = []
 
-        def mock_chat(base_url, chat_model, messages, timeout_sec, extra_options=None, tools=None, **kwargs):
+        def mock_chat(cfg, messages, timeout_sec=30.0, extra_options=None, tools=None, **kwargs):
             captured_messages.extend(messages)
             return create_mock_llm_response(
                 "Based on your love for Italian food and goal to eat more veggies, "
@@ -567,7 +567,7 @@ class TestMemoryEnrichment:
         })
 
         call_count = 0
-        def mock_chat(base_url, chat_model, messages, timeout_sec, extra_options=None, tools=None, **kwargs):
+        def mock_chat(cfg, messages, timeout_sec=30.0, extra_options=None, tools=None, **kwargs):
             nonlocal call_count
             call_count += 1
 
@@ -1448,7 +1448,7 @@ class TestMalformedResponseAfterTools:
 
         call_count = 0
 
-        def mock_chat(base_url, chat_model, messages, timeout_sec, extra_options=None, tools=None, **kwargs):
+        def mock_chat(cfg, messages, timeout_sec=30.0, extra_options=None, tools=None, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
