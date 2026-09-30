@@ -405,6 +405,126 @@ def extract_search_params_for_memory(query: str, cfg, chat_model: str,
     return {}
 
 
+# ── Stored-fact selection ──────────────────────────────────────────────────
+#
+# Picks which warm-profile facts about the user are relevant to the current
+# message, so the reply sees those and not every fact on every turn. The
+# answer is a list of fact numbers constrained by an enum in the schema, so
+# the model can only choose among facts it was shown.
+
+FACT_SELECTION_MAX_CANDIDATES = 40
+FACT_SELECTION_MAX_PICKS = 5
+_FACT_LINE_MAX_CHARS = 300
+# '{"facts": [' + up to five two-digit numbers with separators + ']}' at
+# roughly three characters per token, with headroom for whitespace.
+_FACT_SELECTION_MAX_TOKENS = 32
+
+_FACT_SELECTION_SYSTEM_PROMPT = """You decide which stored facts about the user a voice assistant should see before replying to the user's current message.
+
+Pick a fact when:
+- the message is about the same thing as the fact, even in different words (an activity, routine, meal, pet, place, person or piece of work the fact describes);
+- the message needs a detail the assistant's context does not give and the fact supplies it: when the message depends on where the user is (weather, nearby places) and the context shows the location as Disabled or unknown, pick the fact that says where the user lives;
+- the message asks what you know or remember about the user in general;
+- the message asks for something personal (a suggestion, recommendation or plan for the user) that the fact should shape;
+- the message is open-ended small talk with no topic of its own: pick one or two facts about the user's interests, activities or tastes that the assistant could build a reply around.
+
+Pick nothing when the message is about something else: general knowledge, a named film, book, person or place the facts do not mention, the time, arithmetic, the news, or a task the facts do not bear on. Never pick a fact only because it shares a word with the message, and never pick a fact only because it repeats something the context already shows. Use the recent dialogue only to work out what the current message refers to.
+
+Reply with JSON: {"facts": [numbers of the chosen facts]}. Use an empty list when no fact is relevant."""
+
+
+def fact_selection_schema(count: int) -> dict:
+    """JSON schema for a selection over ``count`` numbered facts."""
+    return {
+        "type": "object",
+        "properties": {
+            "facts": {
+                "type": "array",
+                "items": {"type": "integer", "enum": list(range(1, count + 1))},
+                "maxItems": min(count, FACT_SELECTION_MAX_PICKS),
+            },
+        },
+        "required": ["facts"],
+    }
+
+
+def parse_fact_selection(response: Optional[str], count: int) -> Optional[list[int]]:
+    """Validate a selection answer; return sorted zero-based indices or None."""
+    if not response or not response.strip():
+        debug_log("fact selection validation: rejected (empty response)", "memory")
+        return None
+    try:
+        raw = _loads_json_object(response)
+    except (ValueError, TypeError):
+        debug_log("fact selection validation: rejected (not a JSON object)", "memory")
+        return None
+    picks = raw.get("facts") if isinstance(raw, dict) else None
+    if not isinstance(picks, list):
+        debug_log("fact selection validation: rejected (no facts list)", "memory")
+        return None
+    indices: list[int] = []
+    for pick in picks:
+        if isinstance(pick, bool) or not isinstance(pick, int) or not 1 <= pick <= count:
+            debug_log(f"fact selection validation: rejected (invalid fact number {pick!r})", "memory")
+            return None
+        if pick - 1 not in indices:
+            indices.append(pick - 1)
+    if len(indices) > FACT_SELECTION_MAX_PICKS:
+        debug_log("fact selection validation: rejected (too many facts)", "memory")
+        return None
+    debug_log("fact selection validation: ok", "memory")
+    return sorted(indices)
+
+
+def select_relevant_facts(query: str, facts: list[str], cfg, chat_model: str,
+                          timeout_sec: float = 8.0,
+                          context_hint: Optional[str] = None) -> Optional[list[int]]:
+    """Return zero-based indices of the ``facts`` relevant to ``query``.
+
+    ``facts`` beyond ``FACT_SELECTION_MAX_CANDIDATES`` are not shown and never
+    selected. ``context_hint`` is the live context summary (time, location,
+    recent dialogue) the extractor also receives. Returns ``[]`` when there is
+    nothing to choose from and ``None`` when no valid answer arrives within two
+    identical attempts, so the caller can fall back.
+    """
+    facts = [f.strip()[:_FACT_LINE_MAX_CHARS] for f in facts[:FACT_SELECTION_MAX_CANDIDATES]]
+    if not facts:
+        return []
+    if not (chat_model or "").strip():
+        debug_log("fact selection skipped: no chat model configured", "memory")
+        return None
+    numbered = "\n".join(f"{i}. {fact}" for i, fact in enumerate(facts, 1))
+    parts = [f"Stored facts:\n{numbered}"]
+    if context_hint and context_hint.strip():
+        parts.append(f"Already in the assistant's context:\n{context_hint.strip()}")
+    parts.append(f"Current message: {query}")
+    user_content = "\n\n".join(parts)
+    schema = fact_selection_schema(len(facts))
+    try:
+        for attempt in (1, 2):
+            response = call_llm_direct(
+                cfg=cfg,
+                chat_model=chat_model,
+                system_prompt=_FACT_SELECTION_SYSTEM_PROMPT,
+                user_content=user_content,
+                timeout_sec=timeout_sec,
+                thinking=False,
+                temperature=decision_temperature(cfg),
+                max_tokens=_FACT_SELECTION_MAX_TOKENS,
+                json_schema=schema,
+            )
+            debug_log(f"fact selection raw (attempt {attempt}): {response!r}", "memory")
+            picks = parse_fact_selection(response, len(facts))
+            if picks is not None:
+                return picks
+            if attempt == 1:
+                debug_log("fact selection: no valid answer, retrying once with the same request", "memory")
+    except Exception as e:
+        debug_log(f"fact selection failed: {e}", "memory")
+    debug_log("fact selection result: none (no valid answer after 2 attempts)", "memory")
+    return None
+
+
 # ── Memory digest ───────────────────────────────────────────────────────────
 
 # Below this size, skip the distil round-trip entirely — the raw text is

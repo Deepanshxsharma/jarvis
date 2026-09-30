@@ -146,7 +146,7 @@ def _cfg(db_path):
     return cfg
 
 
-def _run_engine(db_path, text):
+def _run_engine(db_path, text, picks=()):
     chats = []
 
     def fake_chat(**kwargs):
@@ -156,6 +156,7 @@ def _run_engine(db_path, text):
     with patch("src.jarvis.reply.engine.plan_query", return_value=["Reply to the user."]) as plan, \
          patch("src.jarvis.reply.engine.select_tools", return_value=["webSearch", "stop"]), \
          patch("src.jarvis.reply.engine.extract_search_params_for_memory", return_value={}), \
+         patch("src.jarvis.reply.engine.select_relevant_facts", return_value=list(picks)), \
          patch("src.jarvis.reply.engine.chat_with_messages", side_effect=fake_chat):
         run_reply_engine(db=Mock(), cfg=_cfg(db_path), tts=None, text=text, dialogue_memory=None)
     return plan, chats[0]
@@ -189,10 +190,16 @@ class TestEngineGrounding:
         assert "Orbitly" not in messages[-1]["content"]
 
     def test_user_facts_ride_in_user_turn_and_directives_stay_in_system(self, seeded_db):
-        _, messages = _run_engine(seeded_db, "who won the football last night?")
+        _, messages = _run_engine(seeded_db, "what should I have for dinner?", picks=[0])
 
         system, user_turn = messages[0]["content"], messages[-1]["content"]
         assert "The user loves Thai food." in user_turn.split(STORED_FACTS_CLOSE)[0]
         assert "The user loves Thai food." not in system
         assert "Always answer in one sentence." in system
         assert "Always answer in one sentence." not in user_turn
+
+    def test_directives_stay_in_system_when_no_user_fact_is_relevant(self, seeded_db):
+        _, messages = _run_engine(seeded_db, "who won the football last night?", picks=[])
+
+        assert "Always answer in one sentence." in messages[0]["content"]
+        assert "Thai food" not in messages[-1]["content"]

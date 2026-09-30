@@ -5,7 +5,9 @@ Handles memory enrichment, tool planning and execution.
 """
 
 from __future__ import annotations
+import hashlib
 import threading
+from time import perf_counter
 from typing import Callable, Optional, TYPE_CHECKING
 
 from ..utils.redact import redact
@@ -55,6 +57,8 @@ def chat_with_messages(cfg, messages, *, timeout_sec=30.0, extra_options=None,
 from . import timing as _timing
 from .enrichment import (
     extract_search_params_for_memory,
+    FACT_SELECTION_MAX_CANDIDATES,
+    select_relevant_facts,
     digest_memory_for_query,
     digest_tool_result_for_query,
     digest_loop_for_max_turns,
@@ -778,6 +782,28 @@ def _previous_turn_failed_tool_names(recent_messages: list) -> list[str]:
     return list(reversed(failed_names_text_tool)) + failed_names_native
 
 
+def _grounding_result(reply: str, facts: list[str], warm_facts: list[str], query: str) -> str:
+    """Debug-only verdict: does the reply use any of the facts given to it?
+
+    A fact counts as used when the reply repeats one of its distinctive words:
+    at least four characters, not in the query, and not shared by every warm
+    fact (so boilerplate such as a common subject word does not count).
+    """
+    if not facts:
+        return "not applicable (no stored facts in the prompt)"
+
+    def words(text: str) -> set[str]:
+        return {w.casefold() for w in re.findall(r"\w{4,}", text or "")}
+
+    common = set.intersection(*(words(f) for f in warm_facts)) if len(warm_facts) > 1 else set()
+    reply_words = words(reply)
+    excluded = common | words(query)
+    used = [f for f in facts if (words(f) - excluded) & reply_words]
+    if used:
+        return f"grounded (uses {len(used)} of {len(facts)} stored fact(s))"
+    return f"ungrounded (uses none of {len(facts)} stored fact(s))"
+
+
 def _build_enrichment_context_hint(cfg, recent_messages: list) -> Optional[str]:
     """Compact summary of live context for the query extractor and tool router.
 
@@ -958,6 +984,126 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
     # come out concrete ("getWeather location='Paris'") so the direct-exec
     # fast path parses without needing the resolver LLM round-trip.
     context_hint = _build_enrichment_context_hint(cfg, recent_messages)
+
+    # Warm profile — pull the User + Directives branches of the knowledge
+    # graph. These two branches are bounded by design (identity + standing
+    # rules) and change rarely, so they are loaded every turn with a pure
+    # SQLite traversal and no LLM call.
+    #
+    # The two branches land in different places: standing instructions
+    # (Directives) stay in the system prompt as rules on every turn, while
+    # User facts are candidates for the stored-facts block in the current
+    # user turn (see ``format_stored_facts_block``), where small models
+    # actually use them. Only the User facts relevant to this message go in
+    # (fact selection, below).
+    warm_profile_block = ""
+    warm_user_facts = ""
+    # Conversation-scoped cache: warm profile is query-agnostic and the
+    # User / Directives branches change rarely, so reusing the block for
+    # the lifetime of the conversation saves the SQLite BFS on every
+    # follow-up turn. The cache is invalidated on:
+    #   - new conversation entry (cleared above with the full hot cache),
+    #   - the stop signal (also clears the full hot cache),
+    #   - any User/Directives graph mutation (via the listener registered
+    #     in daemon.py, which calls ``invalidate_warm_profile`` on the
+    #     active DialogueMemory).
+    _wp_cache_key = getattr(
+        type(dialogue_memory),
+        "WARM_PROFILE_CACHE_KEY",
+        "warm_profile_block",
+    ) if dialogue_memory else "warm_profile_block"
+    _wp_cached = (
+        dialogue_memory.hot_cache_get(_wp_cache_key)
+        if dialogue_memory and hasattr(dialogue_memory, "hot_cache_get") else None
+    )
+    if isinstance(_wp_cached, dict):
+        warm_profile_block = str(_wp_cached.get("directives_block", ""))
+        warm_user_facts = str(_wp_cached.get("user", ""))
+        debug_log("warm profile served from conversation cache", "memory")
+    else:
+        try:
+            from ..memory.graph import GraphMemoryStore
+            from ..memory.graph_ops import build_warm_profile, format_warm_profile_block
+            _graph_store_warm = GraphMemoryStore(cfg.db_path)
+            _warm_profile = build_warm_profile(_graph_store_warm)
+            warm_user_facts = (_warm_profile.get("user") or "").strip()
+            warm_profile_block = format_warm_profile_block(
+                {"user": "", "directives": _warm_profile.get("directives", "")}
+            )
+            if warm_user_facts or warm_profile_block:
+                _user_len = len(_warm_profile.get("user", ""))
+                _dir_len = len(_warm_profile.get("directives", ""))
+                print(
+                    f"  🪴 Warm profile: {_user_len} user chars, "
+                    f"{_dir_len} directive chars",
+                    flush=True,
+                )
+                debug_log(
+                    f"warm profile loaded: user={_user_len} directives={_dir_len}",
+                    "memory",
+                )
+            if dialogue_memory and hasattr(dialogue_memory, "hot_cache_put"):
+                dialogue_memory.hot_cache_put(
+                    _wp_cache_key,
+                    {"user": warm_user_facts, "directives_block": warm_profile_block},
+                )
+        except Exception as e:
+            debug_log(f"warm profile load failed (non-fatal): {e}", "memory")
+
+    # Fact selection: which warm-profile User facts are relevant to this
+    # message. A fact naming a word the query uses (see ``named_terms``) is
+    # included without any LLM call. The rest go to one FAST-tier selection
+    # call that runs in a background thread while the tool router works, so
+    # its latency overlaps the router's instead of adding to it. The result
+    # is cached per conversation for the same query and facts. When the call
+    # yields no valid answer, every warm fact is used, as before selection
+    # existed.
+    from ..memory.graph import named_terms, query_words
+    warm_fact_lines = [
+        _line.strip() for _line in warm_user_facts.split("\n") if _line.strip()
+    ][:FACT_SELECTION_MAX_CANDIDATES]
+    _query_words = query_words(redacted)
+    named_fact_indices = [
+        _i for _i, _line in enumerate(warm_fact_lines) if named_terms(_line) & _query_words
+    ]
+    _selection_state: dict = {}
+    _selection_thread: Optional[threading.Thread] = None
+    _selection_cache_key = (
+        "fact_selection:" + redacted + "|"
+        + hashlib.sha1("\n".join(warm_fact_lines).encode("utf-8")).hexdigest()[:16]
+    )
+    _selection_timeout = float(getattr(cfg, "llm_tools_timeout_sec", 8.0))
+    if len(named_fact_indices) < len(warm_fact_lines):
+        _cached_picks = (
+            dialogue_memory.hot_cache_get(_selection_cache_key)
+            if dialogue_memory and hasattr(dialogue_memory, "hot_cache_get") else None
+        )
+        if isinstance(_cached_picks, list):
+            _selection_state["picks"] = list(_cached_picks)
+            debug_log("fact selection served from hot-window cache", "memory")
+        else:
+            _selection_model = resolve_model(cfg, Tier.FAST)
+
+            def _run_fact_selection() -> None:
+                _started = perf_counter()
+                try:
+                    _selection_state["picks"] = select_relevant_facts(
+                        redacted, warm_fact_lines, cfg, _selection_model,
+                        timeout_sec=_selection_timeout,
+                        context_hint=context_hint,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    debug_log(f"fact selection thread failed: {exc}", "memory")
+                    _selection_state["picks"] = None
+                _selection_state["seconds"] = perf_counter() - _started
+
+            _selection_thread = threading.Thread(
+                target=_run_fact_selection, name="fact-selection", daemon=True,
+            )
+            _selection_thread.start()
+    else:
+        _selection_state["picks"] = []
+
     try:
         strategy = ToolSelectionStrategy(getattr(cfg, "tool_selection_strategy", "llm"))
     except ValueError:
@@ -1060,6 +1206,48 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             if _nm:
                 _planner_tool_catalog.append((str(_nm), _first[:120]))
 
+    # Collect the fact selection started before the router.
+    if _selection_thread is not None:
+        with _timing.stage("profile"):
+            _selection_thread.join(timeout=2 * _selection_timeout + 1.0)
+        if _selection_thread.is_alive():
+            debug_log("fact selection still running at its deadline; ignoring it", "memory")
+            _selection_state["picks"] = None
+        elif (
+            _selection_state.get("picks") is not None
+            and dialogue_memory and hasattr(dialogue_memory, "hot_cache_put")
+        ):
+            dialogue_memory.hot_cache_put(_selection_cache_key, list(_selection_state["picks"]))
+        debug_log(
+            f"fact selection took {_selection_state.get('seconds', 0.0) * 1000:.0f}ms "
+            f"(overlapped with the tool router)",
+            "memory",
+        )
+    _llm_picks = _selection_state.get("picks")
+    if _llm_picks is None:
+        selected_fact_indices = list(range(len(warm_fact_lines)))
+        debug_log("fact selection unavailable: using every warm-profile fact", "memory")
+    else:
+        selected_fact_indices = sorted(set(named_fact_indices) | set(_llm_picks))
+    selected_user_facts = [warm_fact_lines[_i] for _i in selected_fact_indices]
+    if warm_fact_lines:
+        _fallback_note = " (selection unavailable, using all)" if _llm_picks is None else ""
+        print(
+            f"  🧷 Stored facts: {len(selected_user_facts)} of {len(warm_fact_lines)} "
+            f"relevant{_fallback_note}",
+            flush=True,
+        )
+    debug_log(
+        "grounding: memory relevance "
+        + ("yes" if selected_user_facts else "no")
+        + f" — {len(selected_user_facts)} of {len(warm_fact_lines)} warm facts selected "
+        + f"(named-term matches: {len(named_fact_indices)})",
+        "grounding",
+    )
+    for _n, _line in enumerate(warm_fact_lines, 1):
+        _mark = "selected" if (_n - 1) in selected_fact_indices else "not selected"
+        debug_log(f"grounding: retrieved memory {_n}. [{_mark}] {_line}", "grounding")
+
     # Known-entity lookup: before any planning, check whether the query
     # names something the World branch of the knowledge graph holds facts
     # about (a project, business, product the user told us about). This is
@@ -1069,11 +1257,15 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
     # one) is answered from memory rather than a misdirected search. User
     # and Directives nodes are skipped because the warm profile already
     # carries them.
+    # World facts are included the same way at line level: a World-branch
+    # fact line whose named terms the query mentions (for facts stored on a
+    # broad node such as the World branch itself, which the name lookup
+    # never matches).
     entity_fact_lines: list[str] = []
     entity_node_ids: set[str] = set()
     if getattr(cfg, "memory_enrichment_source", "all") in ("all", "graph"):
         try:
-            from ..memory.graph import GraphMemoryStore, BRANCH_USER, BRANCH_DIRECTIVES
+            from ..memory.graph import GraphMemoryStore, BRANCH_USER, BRANCH_DIRECTIVES, BRANCH_WORLD
             _entity_store = GraphMemoryStore(cfg.db_path)
             for _node in _entity_store.find_nodes_named_in(
                 redacted, limit=3,
@@ -1081,6 +1273,13 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             ):
                 _path = " > ".join(a.name for a in _entity_store.get_ancestors(_node.id))
                 entity_fact_lines.append(f"[{_path}] {_node.data.strip()[:300]}")
+                entity_node_ids.add(_node.id)
+            for _node, _line in _entity_store.find_fact_lines_naming(
+                redacted, BRANCH_WORLD, limit=5,
+                exclude_node_ids=frozenset(entity_node_ids),
+            ):
+                _path = " > ".join(a.name for a in _entity_store.get_ancestors(_node.id))
+                entity_fact_lines.append(f"[{_path}] {_line[:300]}")
                 entity_node_ids.add(_node.id)
             if entity_fact_lines:
                 print(
@@ -1119,8 +1318,8 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
         and getattr(cfg, "planner_enabled", True)
     )
     if _skip_planner:
-        # Positive signal: no tools, no memory needed. The warm profile
-        # (injected unconditionally below) provides user-context for the
+        # Positive signal: no tools, no memory needed. The selected warm
+        # facts (stored-facts block below) provide user context for the
         # chat model; memory enrichment is skipped as if the planner had
         # emitted a single "Reply to the user." step.
         action_plan = ["Reply to the user."]
@@ -1137,7 +1336,7 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                     query=redacted,
                     dialogue_context=_dialogue_ctx,
                     tools=_planner_tool_catalog,
-                    stored_facts="\n".join(entity_fact_lines),
+                    stored_facts="\n".join(entity_fact_lines + selected_user_facts),
                 )
         except Exception as _plan_exc:  # pragma: no cover — defensive
             debug_log(f"planner step failed (non-fatal): {_plan_exc}", "planning")
@@ -1189,76 +1388,6 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             _memory_topic_hint = memory_topic_of(_step)
             if _memory_topic_hint:
                 break
-
-    # Step 3.5: Warm profile — pull the User + Directives branches of
-    # the knowledge graph into a compact, query-agnostic block that gets
-    # injected into the system prompt on every turn. These two branches
-    # are bounded by design (identity + standing rules), don't depend on
-    # the query, and changing rarely — so loading them unconditionally
-    # is the right tradeoff. No LLM call, just a SQLite traversal.
-    #
-    # This is the architectural pivot that lets the planner stop routing
-    # personalisation queries through searchMemory: "news that might
-    # interest me" can be answered directly when the model already sees
-    # the user's interests in its system prompt.
-    #
-    # The two branches land in different places: standing instructions
-    # (Directives) stay in the system prompt as rules, while User facts ride
-    # in the current user turn inside the delimited stored-facts block (see
-    # ``format_stored_facts_block``), where small models actually use them.
-    warm_profile_block = ""
-    warm_user_facts = ""
-    # Conversation-scoped cache: warm profile is query-agnostic and the
-    # User / Directives branches change rarely, so reusing the block for
-    # the lifetime of the conversation saves the SQLite BFS on every
-    # follow-up turn. The cache is invalidated on:
-    #   - new conversation entry (cleared above with the full hot cache),
-    #   - the stop signal (also clears the full hot cache),
-    #   - any User/Directives graph mutation (via the listener registered
-    #     in daemon.py, which calls ``invalidate_warm_profile`` on the
-    #     active DialogueMemory).
-    _wp_cache_key = getattr(
-        type(dialogue_memory),
-        "WARM_PROFILE_CACHE_KEY",
-        "warm_profile_block",
-    ) if dialogue_memory else "warm_profile_block"
-    _wp_cached = (
-        dialogue_memory.hot_cache_get(_wp_cache_key)
-        if dialogue_memory and hasattr(dialogue_memory, "hot_cache_get") else None
-    )
-    if isinstance(_wp_cached, dict):
-        warm_profile_block = str(_wp_cached.get("directives_block", ""))
-        warm_user_facts = str(_wp_cached.get("user", ""))
-        debug_log("warm profile served from conversation cache", "memory")
-    else:
-        try:
-            from ..memory.graph import GraphMemoryStore
-            from ..memory.graph_ops import build_warm_profile, format_warm_profile_block
-            _graph_store_warm = GraphMemoryStore(cfg.db_path)
-            _warm_profile = build_warm_profile(_graph_store_warm)
-            warm_user_facts = (_warm_profile.get("user") or "").strip()
-            warm_profile_block = format_warm_profile_block(
-                {"user": "", "directives": _warm_profile.get("directives", "")}
-            )
-            if warm_user_facts or warm_profile_block:
-                _user_len = len(_warm_profile.get("user", ""))
-                _dir_len = len(_warm_profile.get("directives", ""))
-                print(
-                    f"  🪴 Warm profile: {_user_len} user chars, "
-                    f"{_dir_len} directive chars",
-                    flush=True,
-                )
-                debug_log(
-                    f"warm profile loaded: user={_user_len} directives={_dir_len}",
-                    "memory",
-                )
-            if dialogue_memory and hasattr(dialogue_memory, "hot_cache_put"):
-                dialogue_memory.hot_cache_put(
-                    _wp_cache_key,
-                    {"user": warm_user_facts, "directives_block": warm_profile_block},
-                )
-        except Exception as e:
-            debug_log(f"warm profile load failed (non-fatal): {e}", "memory")
 
     # Step 4: Memory enrichment — controlled by cfg.memory_enrichment_source
     # "all" = diary + graph, "diary" = diary only, "graph" = graph only
@@ -1380,7 +1509,7 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             debug_log("skipping graph enrichment: no implicit questions to answer", "memory")
         else:
             try:
-                from ..memory.graph import GraphMemoryStore
+                from ..memory.graph import GraphMemoryStore, BRANCH_USER
                 graph_store = GraphMemoryStore(cfg.db_path)
 
                 graph_parts: list[str] = []
@@ -1408,6 +1537,12 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                         if node.id in entity_node_ids:
                             continue
                         ancestors = graph_store.get_ancestors(node.id)
+                        # User facts reach the reply only through fact
+                        # selection; a User node here would bring back all
+                        # of its facts, relevant or not.
+                        if any(getattr(a, "id", None) == BRANCH_USER for a in ancestors):
+                            debug_log("graph hit skipped: User-branch node (covered by fact selection)", "memory")
+                            continue
                         path = " > ".join(a.name for a in ancestors)
                         data_preview = node.data[:300] if node.data else ""
                         if data_preview:
@@ -1701,10 +1836,13 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
     if recent_messages:
         messages.extend(recent_messages)
     # Current user message, preceded (inside the same turn) by the delimited
-    # stored-facts block when memory holds user facts or facts about
-    # entities the query names. Dialogue memory records ``redacted`` only.
+    # stored-facts block when memory holds user facts relevant to this
+    # message or facts about entities the query names. Dialogue memory
+    # records ``redacted`` only.
     from ..memory.graph_ops import format_stored_facts_block
-    _stored_facts_block = format_stored_facts_block(warm_user_facts, entity_fact_lines)
+    _stored_facts_block = format_stored_facts_block(
+        "\n".join(selected_user_facts), entity_fact_lines,
+    )
     user_msg_index = len(messages)
     if _stored_facts_block:
         messages.append({
@@ -1713,6 +1851,24 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
         })
     else:
         messages.append({"role": "user", "content": redacted})
+    debug_log(f"grounding: query {redacted!r}", "grounding")
+    debug_log(
+        "grounding: prompt sections — "
+        f"system={len(messages[0]['content'])} chars "
+        f"(persona={len(_persona_prompt)}, directives={len(warm_profile_block)}, "
+        f"diary={len(conversation_context)}, knowledge={len(graph_context)}, "
+        f"digest={len(memory_digest_text)}, "
+        f"tool_descriptions={len(tools_desc) if use_text_tools and tools_desc else 0}); "
+        f"conversation={len(recent_messages or [])} message(s); "
+        f"memory={len(_stored_facts_block)} chars "
+        f"({len(selected_user_facts)} user fact(s), {len(entity_fact_lines)} named fact(s)); "
+        f"user={len(redacted)} chars; tools={','.join(allowed_tools)}",
+        "grounding",
+    )
+    if warm_profile_block:
+        debug_log(f"grounding: warm profile directives {warm_profile_block!r}", "grounding")
+    if _stored_facts_block:
+        debug_log(f"grounding: memory section {_stored_facts_block!r}", "grounding")
 
     # Idempotent flag — once carryover capture runs (success, error, or stop),
     # don't run it again. Lets us call _maybe_record_tool_carryover from any
@@ -2740,6 +2896,12 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
     if not safe_reply:
         safe_reply = "Sorry, I had trouble processing that. Could you try again?"
         reply = safe_reply
+    debug_log(f"grounding: model response {safe_reply!r}", "grounding")
+    debug_log(
+        f"grounding: result {_grounding_result(safe_reply, selected_user_facts + entity_fact_lines, warm_fact_lines, redacted)} "
+        f"(tool results this turn: {len(invoked_tools_history)})",
+        "grounding",
+    )
     if safe_reply:
         # Print reply with appropriate header. Quiet mode (text chat) skips
         # this entirely so the reply never reaches the daemon stdout that

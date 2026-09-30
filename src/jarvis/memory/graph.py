@@ -84,6 +84,43 @@ def normalise_fact(text: str) -> str:
     return _WS_RE.sub(" ", folded.strip())
 
 
+# ── Named terms ────────────────────────────────────────────────────────────
+#
+# Stored facts name things with capitalised words ("Thai", "NovaForge",
+# "PHP", "Trenches Gym"). A query that repeats one of those words is about
+# that fact, so the reply layer includes it without asking a model. Words
+# opening a sentence are capitalised by sentence case alone, so they count
+# only when they carry capitals past the first letter or the next word is
+# capitalised too (a multi-word name). Scripts without letter case yield no
+# terms and leave relevance to the model-based selection.
+
+_WORD_RE = re.compile(r"\w+")
+_SENTENCE_END_RE = re.compile(r"[.!?]\s*$")
+
+
+def named_terms(text: str) -> frozenset[str]:
+    """Return the casefolded name-like words of a stored fact line."""
+    words = list(_WORD_RE.finditer(text or ""))
+    terms: set[str] = set()
+    for i, match in enumerate(words):
+        word = match.group(0)
+        if len(word) < 2 or not word[0].isupper():
+            continue
+        sentence_start = i == 0 or bool(_SENTENCE_END_RE.search(text[:match.start()]))
+        if sentence_start:
+            inner_capitals = any(c.isupper() for c in word[1:])
+            next_capitalised = i + 1 < len(words) and words[i + 1].group(0)[0].isupper()
+            if not (inner_capitals or next_capitalised):
+                continue
+        terms.add(normalise_fact(word))
+    return frozenset(terms)
+
+
+def query_words(text: str) -> frozenset[str]:
+    """Return the casefolded words of a query, for matching named terms."""
+    return frozenset(normalise_fact(w) for w in _WORD_RE.findall(text or ""))
+
+
 # ── Configuration defaults ──────────────────────────────────────────────────
 
 SPLIT_THRESHOLD = 1500       # tokens — when to split a node into children
@@ -796,6 +833,51 @@ class GraphMemoryStore:
             self.touch_node(node.id)
         debug_log(f"Graph name lookup matched {len(nodes)} nodes", "memory")
         return nodes
+
+    def find_fact_lines_naming(
+        self,
+        text: str,
+        branch_id: str,
+        limit: int = 5,
+        exclude_node_ids: frozenset[str] = frozenset(),
+    ) -> list[tuple[MemoryNode, str]]:
+        """Return ``(node, line)`` pairs for fact lines in a branch whose named
+        terms (see ``named_terms``) the text mentions.
+
+        Deterministic and LLM-free. Lines naming more of the text's words rank
+        first, then nodes by decayed access score; matched nodes are touched
+        like search hits.
+        """
+        words = query_words(text)
+        if not words:
+            return []
+        with self._lock:
+            rows = self.conn.execute(
+                f"""WITH RECURSIVE subtree(id) AS (
+                        SELECT ? UNION
+                        SELECT m.id FROM memory_nodes m JOIN subtree s ON m.parent_id = s.id
+                    )
+                    SELECT * FROM memory_nodes
+                    WHERE id IN (SELECT id FROM subtree) AND data != ''
+                    ORDER BY {_decay_score_sql()} DESC""",
+                (branch_id,),
+            ).fetchall()
+        scored: list[tuple[int, int, MemoryNode, str]] = []
+        for order, row in enumerate(rows):
+            node = self._row_to_node(row)
+            if node.id in exclude_node_ids:
+                continue
+            for line in node.data.split("\n"):
+                line = line.strip()
+                hits = len(named_terms(line) & words) if line else 0
+                if hits:
+                    scored.append((-hits, order, node, line))
+        scored.sort(key=lambda item: (item[0], item[1]))
+        matches = [(node, line) for _, _, node, line in scored[:limit]]
+        for node_id in dict.fromkeys(node.id for node, _ in matches):
+            self.touch_node(node_id)
+        debug_log(f"Graph named-term lookup matched {len(matches)} lines in {branch_id}", "memory")
+        return matches
 
     def find_node_by_name(self, name: str, parent_id: Optional[str] = None) -> Optional[MemoryNode]:
         """Find a node by exact name match (case-insensitive), optionally under a specific parent."""
