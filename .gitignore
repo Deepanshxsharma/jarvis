@@ -1,4 +1,5 @@
 .DS_Store
+._*
 .env/
 .venv/
 __pycache__/
@@ -19,7 +20,61 @@ build/
 dist/
 *.spec.backup
 qt.conf
+*.dmg
 
 # Auto-generated version file (created at build time)
 src/jarvis/_version.py
 .reasonix/
+
+# Python environments and caches. Root-anchored so source folders with
+# these names are never hidden.
+/venv/
+/env/
+*.py[co]
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Secrets and credentials. Filename-specific so source files such as the
+# redaction code are never hidden; config templates stay committable.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+auth.json
+client_secret*.json
+service-account*.json
+*credentials*.json
+*secrets*.json
+
+# Model weights and caches. Models are downloaded at runtime, never committed.
+/models/
+/model_cache/
+/huggingface/
+*.gguf
+*.safetensors
+*.onnx
+*.ckpt
+*.pt
+*.pth
+
+# Local runtime data. Jarvis keeps memory, diary and logs under
+# ~/.local/share/jarvis; these rules stop copies landing in the repo.
+# Root-anchored so src/jarvis/memory/ stays tracked.
+/logs/
+*.log
+/data/local/
+/memory/
+/recordings/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
