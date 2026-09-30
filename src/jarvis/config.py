@@ -197,6 +197,10 @@ class Settings:
     # the active chat model on an OpenAI-compatible provider. Read via
     # ``jarvis.llm.resolve_model(cfg, Tier.FAST)``.
     fast_model: str
+    # Sampling temperature for decision contexts (tool routing, planning,
+    # step resolution, memory-search extraction). Read via
+    # ``jarvis.llm.decision_temperature(cfg)``.
+    llm_decision_temperature: float
     intent_judge_timeout_sec: float
 
     # Transcript Buffer - ambient speech context for intent judge
@@ -588,6 +592,9 @@ def get_default_config() -> Dict[str, Any]:
         # DEFAULT_FAST_MODEL on the Ollama chat path, the chat model on an
         # OpenAI-compatible provider.
         "fast_model": "",
+        # Temperature for routing, planning, step resolution and memory
+        # extraction. 0 keeps the same query on the same route and plan.
+        "llm_decision_temperature": 0.0,
         "intent_judge_timeout_sec": 6.0,
         "intent_judge_thinking_enabled": False,  # Enable thinking for intent judge (adds latency to wake detection)
 
@@ -818,6 +825,12 @@ def load_settings() -> Settings:
         fast_model = (
             llm_chat_model if llm_provider == "openai_compatible" else DEFAULT_FAST_MODEL
         )
+    try:
+        llm_decision_temperature = float(merged.get("llm_decision_temperature", 0.0))
+    except (TypeError, ValueError):
+        llm_decision_temperature = 0.0
+    if llm_decision_temperature < 0:
+        llm_decision_temperature = 0.0
     intent_judge_timeout_sec = float(merged.get("intent_judge_timeout_sec", 6.0))
 
     # Transcript Buffer - ambient speech context for intent judge (separate from dialogue)
@@ -993,6 +1006,7 @@ def load_settings() -> Settings:
         echo_tolerance=echo_tolerance,
         # Fast tier (voice intent, tool routing, quick classifications)
         fast_model=fast_model,
+        llm_decision_temperature=llm_decision_temperature,
         intent_judge_timeout_sec=intent_judge_timeout_sec,
 
         # Transcript Buffer

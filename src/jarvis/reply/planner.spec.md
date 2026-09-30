@@ -43,8 +43,19 @@ integration in `src/jarvis/reply/engine.py`.
   runs *after* the planner so it can be gated on its output.
 - The planner sees the **router-narrowed** tool catalogue (name +
   one-line description), not the full 30+ list. It does not see memory
-  content — it decides whether memory is needed, via the
-  `searchMemory` directive.
+  search results — it decides whether memory is needed, via the
+  `searchMemory` directive. The one exception is `stored_facts`: when
+  the engine's deterministic known-entity lookup (see `reply.spec.md`)
+  finds graph facts about something the query names, they are rendered
+  as a `STORED FACTS FROM MEMORY` block in the planner's user message
+  (after DIALOGUE CONTEXT, before USER QUERY) saying the main assistant
+  already has them and a tool step is only needed for what they do not
+  answer. The block is absent when there are no hits, so plans for
+  unrelated queries are unchanged. The system prompt is unchanged.
+- Both the planning call and the step resolver
+  (`resolve_next_tool_call`) sample at `decision_temperature(cfg)`
+  (default 0). At the model default (1.0 for gemma4) the same query
+  produced 3 distinct plans in 8 runs; at 0 it produced 1.
 - Only when the query is at least `MIN_QUERY_CHARS` long (default 4).
   Pure noise like "hi" / "ok" still short-circuits.
 - Only when `cfg.planner_enabled` is True (default).

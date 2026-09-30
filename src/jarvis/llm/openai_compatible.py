@@ -127,6 +127,7 @@ class OpenAICompatibleBackend(LLMBackend):
         thinking: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         # ``thinking`` has no equivalent in the OpenAI shape; reasoning is
         # a model attribute rather than a request flag. It is accepted for
@@ -144,6 +145,11 @@ class OpenAICompatibleBackend(LLMBackend):
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if json_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": json_schema},
+            }
 
         try:
             with requests.post(

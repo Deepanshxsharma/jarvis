@@ -14,6 +14,7 @@ from ..tools.registry import run_tool_with_retries, generate_tools_description, 
 from ..tools.builtin.stop import STOP_SIGNAL
 from ..debug import debug_log
 from ..llm import (
+    decision_temperature,
     extract_text_from_response,
     get_embedding_backend,
     get_llm_backend,
@@ -982,6 +983,7 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                 embed_model=cfg.embedding_model,
                 embed_timeout_sec=float(getattr(cfg, "llm_embedding_timeout_sec", 10.0)),
                 context_hint=context_hint,
+                llm_temperature=decision_temperature(cfg),
             )
         # Don't cache the router's "fall open to all tools" fallback. That
         # path fires when the LLM router times out, returns empty, or emits
@@ -1046,6 +1048,37 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             if _nm:
                 _planner_tool_catalog.append((str(_nm), _first[:120]))
 
+    # Known-entity lookup: before any planning, check whether the query
+    # names something the World branch of the knowledge graph holds facts
+    # about (a project, business, product the user told us about). This is
+    # a single SQLite read with no LLM call, so unrelated queries cost
+    # nothing extra; a hit hands the stored facts to the planner and to the
+    # reply, so a name the web does not know (or confuses with a similar
+    # one) is answered from memory rather than a misdirected search. User
+    # and Directives nodes are skipped because the warm profile already
+    # carries them.
+    entity_fact_lines: list[str] = []
+    entity_node_ids: set[str] = set()
+    if getattr(cfg, "memory_enrichment_source", "all") in ("all", "graph"):
+        try:
+            from ..memory.graph import GraphMemoryStore, BRANCH_USER, BRANCH_DIRECTIVES
+            _entity_store = GraphMemoryStore(cfg.db_path)
+            for _node in _entity_store.find_nodes_named_in(
+                redacted, limit=3,
+                exclude_branches=frozenset({BRANCH_USER, BRANCH_DIRECTIVES}),
+            ):
+                _path = " > ".join(a.name for a in _entity_store.get_ancestors(_node.id))
+                entity_fact_lines.append(f"[{_path}] {_node.data.strip()[:300]}")
+                entity_node_ids.add(_node.id)
+            if entity_fact_lines:
+                print(
+                    f"  🔎 Known entities: {len(entity_fact_lines)} stored fact(s) matched",
+                    flush=True,
+                )
+                debug_log(f"entity lookup hits: {entity_fact_lines}", "memory")
+        except Exception as e:
+            debug_log(f"entity lookup failed (non-fatal): {e}", "memory")
+
     action_plan: list[str] = []
 
     # Fast-path: skip the planner when the tool router found no real tools
@@ -1092,6 +1125,7 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                     query=redacted,
                     dialogue_context=_dialogue_ctx,
                     tools=_planner_tool_catalog,
+                    stored_facts="\n".join(entity_fact_lines),
                 )
         except Exception as _plan_exc:  # pragma: no cover — defensive
             debug_log(f"planner step failed (non-fatal): {_plan_exc}", "planning")
@@ -1155,7 +1189,13 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
     # personalisation queries through searchMemory: "news that might
     # interest me" can be answered directly when the model already sees
     # the user's interests in its system prompt.
+    #
+    # The two branches land in different places: standing instructions
+    # (Directives) stay in the system prompt as rules, while User facts ride
+    # in the current user turn inside the delimited stored-facts block (see
+    # ``format_stored_facts_block``), where small models actually use them.
     warm_profile_block = ""
+    warm_user_facts = ""
     # Conversation-scoped cache: warm profile is query-agnostic and the
     # User / Directives branches change rarely, so reusing the block for
     # the lifetime of the conversation saves the SQLite BFS on every
@@ -1174,8 +1214,9 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
         dialogue_memory.hot_cache_get(_wp_cache_key)
         if dialogue_memory and hasattr(dialogue_memory, "hot_cache_get") else None
     )
-    if isinstance(_wp_cached, str):
-        warm_profile_block = _wp_cached
+    if isinstance(_wp_cached, dict):
+        warm_profile_block = str(_wp_cached.get("directives_block", ""))
+        warm_user_facts = str(_wp_cached.get("user", ""))
         debug_log("warm profile served from conversation cache", "memory")
     else:
         try:
@@ -1183,8 +1224,11 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             from ..memory.graph_ops import build_warm_profile, format_warm_profile_block
             _graph_store_warm = GraphMemoryStore(cfg.db_path)
             _warm_profile = build_warm_profile(_graph_store_warm)
-            warm_profile_block = format_warm_profile_block(_warm_profile)
-            if warm_profile_block:
+            warm_user_facts = (_warm_profile.get("user") or "").strip()
+            warm_profile_block = format_warm_profile_block(
+                {"user": "", "directives": _warm_profile.get("directives", "")}
+            )
+            if warm_user_facts or warm_profile_block:
                 _user_len = len(_warm_profile.get("user", ""))
                 _dir_len = len(_warm_profile.get("directives", ""))
                 print(
@@ -1197,7 +1241,10 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                     "memory",
                 )
             if dialogue_memory and hasattr(dialogue_memory, "hot_cache_put"):
-                dialogue_memory.hot_cache_put(_wp_cache_key, warm_profile_block)
+                dialogue_memory.hot_cache_put(
+                    _wp_cache_key,
+                    {"user": warm_user_facts, "directives_block": warm_profile_block},
+                )
         except Exception as e:
             debug_log(f"warm profile load failed (non-fatal): {e}", "memory")
 
@@ -1337,6 +1384,8 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
                 else:
                     graph_nodes = graph_store.search_nodes(" ".join(question_words), limit=5)
                     for node in graph_nodes:
+                        if node.id in entity_node_ids:
+                            continue
                         ancestors = graph_store.get_ancestors(node.id)
                         path = " > ".join(a.name for a in ancestors)
                         data_preview = node.data[:300] if node.data else ""
@@ -1534,13 +1583,10 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             )
 
         if warm_profile_block:
-            # Pre-query, query-agnostic user context. Lives OUTSIDE the
-            # conversation-history section because it isn't a history
-            # snapshot — it's the assistant's standing knowledge of who
-            # it's serving and what rules it's been told to obey. Kept
-            # here (rather than inside the Diary/Graph enrichment block
-            # below) because it must be present on every turn, not
-            # gated by the planner's searchMemory decision.
+            # Standing instructions from the Directives branch. Present on
+            # every turn, not gated by the planner's searchMemory decision.
+            # User-branch facts are not here: they ride in the user turn's
+            # stored-facts block.
             guidance.append("\n" + warm_profile_block)
 
         if conversation_context:
@@ -1633,9 +1679,19 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
     # Include recent dialogue memory as-is
     if recent_messages:
         messages.extend(recent_messages)
-    # Current user message
+    # Current user message, preceded (inside the same turn) by the delimited
+    # stored-facts block when memory holds user facts or facts about
+    # entities the query names. Dialogue memory records ``redacted`` only.
+    from ..memory.graph_ops import format_stored_facts_block
+    _stored_facts_block = format_stored_facts_block(warm_user_facts, entity_fact_lines)
     user_msg_index = len(messages)
-    messages.append({"role": "user", "content": redacted})
+    if _stored_facts_block:
+        messages.append({
+            "role": "user",
+            "content": f"{_stored_facts_block}\n\nCURRENT USER MESSAGE:\n{redacted}",
+        })
+    else:
+        messages.append({"role": "user", "content": redacted})
 
     # Idempotent flag — once carryover capture runs (success, error, or stop),
     # don't run it again. Lets us call _maybe_record_tool_carryover from any
@@ -1730,6 +1786,43 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
         except Exception:
             pass
         return None, None, None
+
+    def _parse_llm_turn(resp):
+        """Read content, thinking and any tool call from a chat response, and
+        append the assistant message to ``messages`` exactly as received.
+        Returns ``(content, thinking, tool_name, tool_args, tool_call_id)``."""
+        content = extract_text_from_response(resp) or ""
+        content = content.strip() if isinstance(content, str) else ""
+
+        # Check if there's a thinking field when content is empty
+        thinking = ""
+        msg = resp.get("message") if isinstance(resp, dict) else None
+        if isinstance(msg, dict) and "thinking" in msg:
+            thinking = msg.get("thinking", "")
+
+        # Debug: log what we got from the LLM
+        if content:
+            debug_log(f"  📝 LLM response: '{content[:200]}{'...' if len(content) > 200 else ''}'", "planning")
+        else:
+            debug_log("  📝 LLM response: (empty content)", "planning")
+
+        # Always show thinking if present, regardless of content
+        if thinking:
+            debug_log(f"  💭 LLM thinking: '{thinking[:300]}{'...' if len(thinking) > 300 else ''}'", "planning")
+
+        # Extract tool call if present
+        name, args, call_id = _extract_structured_tool_call(resp)
+
+        # ALWAYS append the assistant's response to messages exactly as received,
+        # preserving thinking and native tool_calls fields.
+        assistant_msg = {"role": "assistant", "content": content}
+        if isinstance(msg, dict):
+            if msg.get("thinking"):
+                assistant_msg["thinking"] = msg["thinking"]
+            if msg.get("tool_calls"):
+                assistant_msg["tool_calls"] = msg["tool_calls"]
+        messages.append(assistant_msg)
+        return content, thinking, name, args, call_id
 
     def _get_context_string() -> str:
         """Get current time and location context as a string.
@@ -1856,6 +1949,9 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
     last_candidate_reply: Optional[str] = None
     max_turns = cfg.agentic_max_turns
     turn = 0
+    # The empty-response retry with native tool declarations runs at most
+    # once per reply.
+    _empty_retry_used = False
 
     # Per-reply session id used to group prompt dumps on disk when
     # JARVIS_DUMP_PROMPTS=1 is set. Generated unconditionally so the
@@ -2147,42 +2243,63 @@ def _run_reply_engine_body(db: "Database", cfg, tts: Optional[Any],
             if isinstance(llm_resp, dict) and "message" in llm_resp:
                 debug_log(f"  🔍 Message field: {llm_resp['message']}", "planning")
 
-        content = extract_text_from_response(llm_resp) or ""
-        content = content.strip() if isinstance(content, str) else ""
+        content, thinking, t_name, t_args, t_call_id = _parse_llm_turn(llm_resp)
 
-        # Check if there's a thinking field when content is empty
-        thinking = ""
-        if isinstance(llm_resp, dict) and "message" in llm_resp:
-            msg = llm_resp["message"]
-            if isinstance(msg, dict) and "thinking" in msg:
-                thinking = msg.get("thinking", "")
-
-        # Debug: log what we got from the LLM
-        if content:
-            debug_log(f"  📝 LLM response: '{content[:200]}{'...' if len(content) > 200 else ''}'", "planning")
-        else:
-            debug_log("  📝 LLM response: (empty content)", "planning")
-
-        # Always show thinking if present, regardless of content
-        if thinking:
-            debug_log(f"  💭 LLM thinking: '{thinking[:300]}{'...' if len(thinking) > 300 else ''}'", "planning")
-
-        # Extract tool call if present
-        t_name, t_args, t_call_id = _extract_structured_tool_call(llm_resp)
-
-        # ALWAYS append the assistant's response to messages exactly as received
-        assistant_msg = {"role": "assistant", "content": content}
-
-        # Preserve all fields from the LLM response
-        if isinstance(llm_resp, dict) and "message" in llm_resp:
-            msg = llm_resp["message"]
-            if isinstance(msg, dict):
-                if "thinking" in msg and msg["thinking"]:
-                    assistant_msg["thinking"] = msg["thinking"]
-                if "tool_calls" in msg and msg["tool_calls"]:
-                    assistant_msg["tool_calls"] = msg["tool_calls"]
-
-        messages.append(assistant_msg)
+        # Empty reply in text-tools mode: gemma-family models sometimes emit
+        # their native tool-call tokens even when no tools are declared, and
+        # the server then returns empty content. Re-send the identical request
+        # once with the allowed tools declared natively so the call surfaces
+        # as structured ``tool_calls``. Once per reply, never looped.
+        if (
+            not content and not t_name and not thinking
+            and use_text_tools and tools_json_schema and not _empty_retry_used
+        ):
+            _empty_retry_used = True
+            messages.pop()
+            debug_log(
+                "  🔂 Empty assistant response in text-tools mode — retrying once "
+                f"with {len(tools_json_schema)} native tool declarations",
+                "planning",
+            )
+            print("  🔂 Empty reply — retrying once with tool declarations", flush=True)
+            if speech is not None:
+                speech.begin_turn()
+            try:
+                retry_resp = chat_with_messages(
+                    cfg=cfg,
+                    messages=messages,
+                    timeout_sec=float(getattr(cfg, 'llm_chat_timeout_sec', 45.0)),
+                    extra_options=None,
+                    tools=tools_json_schema,
+                    thinking=getattr(cfg, 'llm_thinking_enabled', False),
+                    on_text=speech.feed if speech is not None else None,
+                    cancel=cancel_event,
+                )
+                dump_reply_turn(
+                    session_id=_dump_session_id,
+                    turn=turn,
+                    query=text,
+                    model=_chat_model,
+                    messages=messages,
+                    tools_schema=tools_json_schema,
+                    use_text_tools=use_text_tools,
+                    response=retry_resp,
+                )
+            except ToolsNotSupportedError:
+                debug_log("  🔂 Retry skipped: native tools API not supported", "planning")
+                retry_resp = None
+            if _cancelled():
+                debug_log("reply cancelled during generation", "planning")
+                return None
+            if retry_resp:
+                llm_resp = retry_resp
+                content, thinking, t_name, t_args, t_call_id = _parse_llm_turn(llm_resp)
+                debug_log(
+                    f"  🔂 Retry result: tool={t_name or '-'} content_chars={len(content)}",
+                    "planning",
+                )
+            else:
+                messages.append({"role": "assistant", "content": ""})
 
         # Check if we're stuck (no content, no tool call)
         if not content and not t_name:

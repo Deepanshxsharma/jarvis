@@ -13,7 +13,13 @@ from ..base import Tool, ToolContext
 from ..types import ToolExecutionResult
 from ..selection import select_tools, ToolSelectionStrategy
 from ...debug import debug_log
-from ...llm import get_embedding_backend, get_llm_backend, resolve_model, Tier
+from ...llm import (
+    decision_temperature,
+    get_embedding_backend,
+    get_llm_backend,
+    resolve_model,
+    Tier,
+)
 
 
 class ToolSearchTool(Tool):
@@ -91,6 +97,7 @@ class ToolSearchTool(Tool):
                 embedding_backend=get_embedding_backend(cfg),
                 embed_model=cfg.embedding_model,
                 embed_timeout_sec=float(getattr(cfg, "llm_embedding_timeout_sec", 10.0)),
+                llm_temperature=decision_temperature(cfg),
             )
         except Exception as e:
             debug_log(f"toolSearchTool: select_tools failed: {e}", "tools")

@@ -242,6 +242,7 @@ def _select_llm(
     llm_model: str,
     llm_timeout_sec: float,
     context_hint: Optional[str] = None,
+    llm_temperature: Optional[float] = None,
 ) -> List[str]:
     """Ask a lightweight LLM call which tools are relevant.
 
@@ -307,8 +308,9 @@ def _select_llm(
                 )
             if dialogue_part:
                 blocks.append(
-                    "RECENT DIALOGUE (most recent last — interpret the current "
-                    "query as a continuation of this exchange):\n"
+                    "RECENT DIALOGUE (background only — use it to resolve what "
+                    "'it', 'there', 'that' or a bare follow-up refers to; it is "
+                    "NOT the current request):\n"
                     f"{dialogue_part}"
                 )
             hint_section = "\n\n".join(blocks) + "\n\n"
@@ -334,6 +336,7 @@ def _select_llm(
         resp = llm_backend.direct(
             llm_model, sys_prompt, user_prompt,
             timeout_sec=llm_timeout_sec,
+            temperature=llm_temperature,
             max_tokens=50,
         )
     except Exception as e:
@@ -392,6 +395,7 @@ def select_tools(
     embed_model: str = "",
     embed_timeout_sec: float = 10.0,
     context_hint: Optional[str] = None,
+    llm_temperature: Optional[float] = None,
 ) -> List[str]:
     """
     Return a list of tool names relevant to *query*.
@@ -410,6 +414,9 @@ def select_tools(
         embed_model:        Embedding model name (needed for "embedding" strategy).
         embed_timeout_sec:  Timeout for embedding calls.
         context_hint:       Optional facts/dialogue surface for the LLM router.
+        llm_temperature:    Sampling temperature for the LLM router; callers
+                            pass ``decision_temperature(cfg)``. None = model
+                            default.
 
     Returns:
         List of tool name strings.
@@ -432,6 +439,7 @@ def select_tools(
             query, builtin_tools, mcp_tools,
             llm_backend, llm_model, llm_timeout_sec,
             context_hint=context_hint,
+            llm_temperature=llm_temperature,
         )
     else:
         return _all_tool_names(builtin_tools, mcp_tools)

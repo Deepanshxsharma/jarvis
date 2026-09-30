@@ -1,23 +1,169 @@
 from __future__ import annotations
-from typing import Optional
-from datetime import datetime, timezone
+import json
+import re
+from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
 
-from ..llm import get_llm_backend, resolve_model, Tier
+from ..llm import get_llm_backend, resolve_model, Tier, decision_temperature
 from ..debug import debug_log
 
 
 def call_llm_direct(*, cfg, chat_model, system_prompt, user_content,
                     timeout_sec=10.0, thinking=False,
-                    temperature=None, max_tokens=None):
+                    temperature=None, max_tokens=None, json_schema=None):
     """Local indirection: route enrichment LLM calls through the backend
     configured by ``cfg.llm_provider``. Tests patch this single symbol
     to intercept every enrichment call."""
+    kwargs: dict[str, Any] = {
+        "timeout_sec": timeout_sec,
+        "thinking": thinking,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if json_schema is not None:
+        kwargs["json_schema"] = json_schema
     return get_llm_backend(cfg).direct(
-        chat_model, system_prompt, user_content,
-        timeout_sec=timeout_sec, thinking=thinking,
-        temperature=temperature,
-        max_tokens=max_tokens,
+        chat_model, system_prompt, user_content, **kwargs,
     )
+
+
+# ── Memory search-parameter extraction ─────────────────────────────────────
+
+# Room for 5 keywords, a couple of implicit questions, a quoted time phrase
+# and two ISO timestamps. The old cap of 50 tokens cut the JSON off mid-way
+# whenever the model emitted questions or a time range, so every such
+# extraction was discarded as unparseable.
+_SEARCH_PARAMS_MAX_TOKENS = 256
+_SEARCH_PARAMS_MAX_KEYWORDS = 8
+_SEARCH_PARAMS_MAX_QUESTIONS = 5
+
+# Largest positive UTC offset in use (UTC+14). A range the model resolved
+# from local time can legitimately start this far ahead of UTC "now".
+_MAX_LOCAL_AHEAD_OF_UTC = timedelta(hours=14)
+
+SEARCH_PARAMS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "questions": {"type": "array", "items": {"type": "string"}},
+        "time_phrase": {"type": "string"},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+    },
+    "required": ["keywords"],
+}
+
+
+def _clean_string_list(value: Any, limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _parse_utc(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_utc(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalise_for_match(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _validated_time_range(raw: dict, query: str, now: datetime) -> dict:
+    """Return ``{"from": ..., "to": ...}`` (either may be absent) only when the
+    range is grounded in the query and semantically valid; otherwise ``{}``.
+
+    Grounding is language-agnostic: the model must quote the time expression
+    it resolved (``time_phrase``) and that quote must occur in the query. A
+    range with no quote, or a quote the query does not contain, is an
+    invented range and is dropped so the diary search runs unfiltered."""
+    has_from = "from" in raw
+    has_to = "to" in raw
+    if not (has_from or has_to):
+        return {}
+
+    phrase = raw.get("time_phrase")
+    phrase_norm = _normalise_for_match(phrase) if isinstance(phrase, str) else ""
+    if len(phrase_norm) < 2 or phrase_norm not in _normalise_for_match(query):
+        debug_log(
+            f"search params: dropped time range with ungrounded time_phrase={phrase!r}",
+            "memory",
+        )
+        return {}
+
+    from_dt = _parse_utc(raw.get("from")) if has_from else None
+    to_dt = _parse_utc(raw.get("to")) if has_to else None
+    if (has_from and from_dt is None) or (has_to and to_dt is None):
+        debug_log("search params: dropped time range with unparseable timestamp", "memory")
+        return {}
+    if from_dt and to_dt and from_dt > to_dt:
+        debug_log("search params: dropped time range with from after to", "memory")
+        return {}
+    if from_dt and from_dt > now + _MAX_LOCAL_AHEAD_OF_UTC:
+        # Memory holds only past conversations; a range starting in the
+        # future can match nothing and would hide every real entry.
+        debug_log("search params: dropped time range starting in the future", "memory")
+        return {}
+
+    out: dict[str, str] = {}
+    if from_dt:
+        out["from"] = _format_utc(from_dt)
+    if to_dt:
+        out["to"] = _format_utc(to_dt)
+    return out
+
+
+def parse_search_params(response: Optional[str], query: str,
+                        now: Optional[datetime] = None) -> Optional[dict]:
+    """Parse and validate an extractor response.
+
+    Returns the sanitised params dict, or ``None`` when the response is
+    missing, truncated, not JSON, or violates the schema (``keywords`` must
+    be a list). Invalid optional fields are dropped rather than failing the
+    whole extraction."""
+    if not response or not response.strip():
+        return None
+    text = response.strip()
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return None
+        try:
+            raw = json.loads(match.group())
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("keywords"), list):
+        return None
+
+    params: dict[str, Any] = {
+        "keywords": _clean_string_list(raw["keywords"], _SEARCH_PARAMS_MAX_KEYWORDS),
+        "questions": _clean_string_list(raw.get("questions"), _SEARCH_PARAMS_MAX_QUESTIONS),
+    }
+    params.update(_validated_time_range(raw, query, now or datetime.now(timezone.utc)))
+    return params
 
 
 def extract_search_params_for_memory(query: str, cfg, chat_model: str,
@@ -58,25 +204,26 @@ def extract_search_params_for_memory(query: str, cfg, chat_model: str,
 
 Extract:
 1. CONTENT KEYWORDS: 3-5 relevant topics/subjects (ignore time words). Include general, high-level category tags that would be suitable for blog-style tagging when applicable (e.g., "cooking", "fitness", "travel", "finance").
-2. TIME RANGE: If mentioned, convert to exact timestamps
+2. TIME RANGE: Only if the query itself names a time, copy that exact time expression from the query into time_phrase and convert it to exact timestamps
 3. QUESTIONS: What implicit personal questions does this query need answered from stored knowledge about the user? These are things the assistant would need to know about the user to give a personalised answer. Omit if the query needs no personal context, OR if the answer is already visible in the ALREADY IN CONTEXT block of the user message.
 
 The user message may include an ALREADY IN CONTEXT block listing facts the assistant can already see (current time/location, recent dialogue). When present, do NOT generate questions whose answers are already there — those facts do not need to be pulled from long-term memory.
 
 Respond ONLY with JSON in this format:
-{"keywords": ["keyword1", "keyword2"], "questions": ["what are the user's food preferences?"], "from": "2025-08-21T00:00:00Z", "to": "2025-08-21T23:59:59Z"}
+{"keywords": ["keyword1", "keyword2"], "questions": ["what are the user's food preferences?"], "time_phrase": "yesterday", "from": "2025-08-21T00:00:00Z", "to": "2025-08-21T23:59:59Z"}
 
 Rules:
 - keywords: content topics only (no time words like "yesterday", "today"). Include both specific terms and general category tags when applicable (e.g., for recipes or meal prep you could include "cooking" and "nutrition").
 - prefer concise noun phrases; lowercase; no punctuation; deduplicate similar terms
 - questions: short personal questions about the user that this query implies. Omit for factual/utility queries (time, maths, definitions) that need no personal context. Also omit any question whose answer is already present in the ALREADY IN CONTEXT block (e.g. do not ask "where is the user located?" when a location is shown there, and do not ask about topics the user just mentioned in the recent dialogue).
-- from/to: only if time mentioned, convert to exact UTC timestamps
-- omit from/to if no time mentioned
+- time_phrase: the time expression copied word for word from the query (e.g. "yesterday", "last week"). Never take it from the context block or the examples.
+- from/to: only together with time_phrase, converted to exact UTC timestamps relative to the current date in the user message
+- omit time_phrase, from and to if the query names no time
 
 Examples:
 "what did we discuss about the warhammer project?" → {"keywords": ["warhammer", "project", "figures", "gaming", "tabletop"]}
-"what did I eat yesterday?" → {"keywords": ["eat", "food", "cooking", "nutrition"], "from": "2025-08-21T00:00:00Z", "to": "2025-08-21T23:59:59Z"}
-"remember that password I mentioned today?" → {"keywords": ["password", "accounts", "security", "credentials"], "from": "2025-08-22T00:00:00Z", "to": "2025-08-22T23:59:59Z"}
+"what did I eat yesterday?" → {"keywords": ["eat", "food", "cooking", "nutrition"], "time_phrase": "yesterday", "from": "2025-08-21T00:00:00Z", "to": "2025-08-21T23:59:59Z"}
+"remember that password I mentioned today?" → {"keywords": ["password", "accounts", "security", "credentials"], "time_phrase": "today", "from": "2025-08-22T00:00:00Z", "to": "2025-08-22T23:59:59Z"}
 "what news might interest me?" → {"keywords": ["interests", "hobbies", "preferences", "likes", "passionate"], "questions": ["what topics interest the user?", "what are the user's hobbies?"]}
 "news of interest to me" / "news that would interest me" / "news interesting for me" / "recall my interests and search for news on them" → {"keywords": ["interests", "hobbies", "preferences", "likes", "passionate"], "questions": ["what topics interest the user?", "what are the user's hobbies?"]}
 "recommend a restaurant I'd enjoy" (no location in context) → {"keywords": ["food preferences", "restaurants", "cuisine", "dining", "favorites"], "questions": ["what cuisine does the user like?", "where is the user located?"]}
@@ -101,20 +248,14 @@ Examples:
                 user_content=user_content,
                 timeout_sec=timeout_sec,
                 thinking=thinking,
-                max_tokens=50,
+                temperature=decision_temperature(cfg),
+                max_tokens=_SEARCH_PARAMS_MAX_TOKENS,
+                json_schema=SEARCH_PARAMS_SCHEMA,
             )
 
-            if response:
-                import re
-                import json
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    try:
-                        params = json.loads(json_match.group())
-                        if 'keywords' in params and isinstance(params['keywords'], list):
-                            return params
-                    except json.JSONDecodeError:
-                        pass
+            params = parse_search_params(response, query)
+            if params is not None:
+                return params
 
             if attempts == 1:
                 debug_log("search parameter extraction: first attempt returned no usable result, retrying", "memory")

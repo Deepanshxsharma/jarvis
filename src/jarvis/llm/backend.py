@@ -94,11 +94,15 @@ class LLMBackend(ABC):
         thinking: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Single-shot system+user prompt; returns the assistant text or
         ``None`` on timeout / error / empty response. Pass ``max_tokens``
         to cap the generation length — essential for small reasoning
-        models that otherwise loop endlessly on classification tasks."""
+        models that otherwise loop endlessly on classification tasks.
+        Pass ``json_schema`` to constrain decoding to JSON matching that
+        schema (structured output); callers must still validate the result
+        because a truncated generation can end mid-object."""
 
     @abstractmethod
     def streaming(

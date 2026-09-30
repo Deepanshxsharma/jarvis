@@ -189,6 +189,7 @@ class OllamaBackend(LLMBackend):
         thinking: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Direct LLM call without temporal context, location, or other
         ``ask_coach`` features.
@@ -203,6 +204,9 @@ class OllamaBackend(LLMBackend):
         total generated tokens (including reasoning). Essential for
         classification calls where small reasoning models otherwise
         loop endlessly.
+
+        ``json_schema`` maps to Ollama's top-level ``format`` field, which
+        constrains decoding to JSON matching the schema.
         """
         messages = [
             {"role": "system", "content": system_prompt},
@@ -214,6 +218,8 @@ class OllamaBackend(LLMBackend):
             payload["options"]["temperature"] = temperature
         if max_tokens is not None:
             payload["options"]["num_predict"] = max_tokens
+        if json_schema is not None:
+            payload["format"] = json_schema
 
         try:
             with requests.post(

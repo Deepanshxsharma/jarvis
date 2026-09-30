@@ -38,7 +38,13 @@ Design principles enforced by the engine:
      - **Tool router** (`router:{redacted_query}|{strategy}|{builtin-names}|{mcp-names}` key): skips the router LLM call when the query and tool catalogue match. The catalogue signature lets a mid-conversation MCP refresh invalidate the cache. The engine refuses to cache the router's "fall open to all tools" fallback (detected by set equality with the full catalogue): that path fires only when the LLM router gave up, and pinning a fluke fall-open into the conversation cache would force every subsequent turn to expose the entire catalogue, overwhelming small chat models.
      - Lifetime: entries persist until (a) the `stop` signal clears the whole cache, (b) the engine detects a new conversation at turn entry (`has_recent_messages()` was False) and clears it before running, or (c) targeted invalidation (warm profile only) on graph mutations. Entries are *not* bounded by `RECENT_WINDOW_SEC` age, so a long active session keeps them warm.
 
-3. Pre-flight Planner
+3. Known-entity Lookup (deterministic, before planning)
+   - Before the planner runs, `GraphMemoryStore.find_nodes_named_in(query, limit=3, exclude_branches={user, directives})` looks for data-bearing graph nodes whose name the query mentions (whole-word, case-insensitive; a name split by speech transcription, e.g. "Nova Forge" for "NovaForge", still matches; names under 3 characters never match). It is a single SQLite read with no LLM call, so unrelated queries pay nothing extra and nothing is injected for them.
+   - Skipped when `memory_enrichment_source` is `"diary"`. User and Directives nodes are excluded because the warm profile already carries them.
+   - Each hit becomes a `[path] data` line (data capped at 300 chars). The lines go to the planner as its `stored_facts` argument and into the reply's stored-facts block (step 6); graph enrichment in step 5 skips the same nodes so they are not repeated.
+   - Why: a name the web does not know, or confuses with a similar one, was otherwise answered from a misdirected web search even though memory held the answer (field probe: a question about a project the user had told Jarvis about was answered about a similarly named company in 4 of 5 runs; with the lookup, 5 of 5 answered from memory).
+
+4. Pre-flight Planner
    - The task-list planner (`plan_query` in `src/jarvis/reply/planner.py`) runs **first**, before any memory lookup or tool routing. It sees the query, a compact dialogue snippet, and the full builtin + MCP tool catalogue (names + one-line descriptions).
    - The planner emits an ordered list of short sub-tasks (max 5). Two of the tokens are structural for the engine:
      - `searchMemory topic='...'` as a leading step means "answering requires information from prior conversations"; the engine runs memory enrichment. Omitting it means "no memory needed".
@@ -47,22 +53,31 @@ Design principles enforced by the engine:
    - A single-step `["Reply to the user."]` plan is a positive "no memory, no tools" decision — the engine skips the memory extractor, the tool router, the diary / graph / digest LLM calls, and the direct-exec path entirely.
    - See `planner.spec.md` for the full prompt contract, helpers, and fail-open invariants.
 
-4. Conversation Memory Enrichment (gated)
+5. Conversation Memory Enrichment (gated)
    - Runs only when the planner emitted a `searchMemory` directive OR the planner returned an empty plan (fail-open). Skipped otherwise, along with the keyword-extractor LLM call, the diary and graph queries, and the memory-digest LLM call.
    - Extract search parameters via `extract_search_params_for_memory(query, base_url, router_model, ..., context_hint=...)`.
      - Runs on the fast tier (`resolve_model(cfg, Tier.FAST)`), not the big chat model. The extractor is a small classification-shaped task and rides the already-warm fast model instead of paging in the chat weights.
      - The planner's `topic` hint (when present) is appended to the query the extractor sees, so keyword selection anchors on what the planner actually wanted to look up.
-     - Output fields: `keywords: List[str]`, optional `from`, optional `to`, optional `questions: List[str]`.
+     - Output fields: `keywords: List[str]`, `questions: List[str]` (possibly empty), optional `from`, optional `to` (ISO 8601 UTC, `...Z`).
+     - Structured output: the call passes `SEARCH_PARAMS_SCHEMA` as `json_schema` (Ollama `format`, OpenAI-compatible `response_format`), samples at `decision_temperature(cfg)`, and allows 256 output tokens (the former 50-token cap cut the JSON off whenever questions or a time range were present, so those extractions were discarded).
+     - Validation (`parse_search_params`): the response must be a JSON object whose `keywords` is a list; otherwise (truncated, non-JSON, wrong types) the attempt is rejected, the call is retried once, and the extractor returns `{}` so enrichment degrades to "no memory" rather than acting on garbage. Non-string list items and duplicates are dropped; keywords are capped at 8 and questions at 5.
+     - Time-range grounding: a `from`/`to` range is kept only when the model also returns `time_phrase`, that phrase occurs in the query (case- and whitespace-insensitive substring match, so it works in any language), both timestamps parse, `from <= to`, and `from` is not in the future (allowing the largest UTC offset). Otherwise the range is dropped and the diary search runs unfiltered, so a range copied from the prompt's examples can no longer hide every real entry.
      - `context_hint` carries a compact summary of what is already live in the assistant's context (current time, location, short-term dialogue). The extractor uses it to skip implicit personal questions whose answers are already visible — those facts do not need to be pulled from long-term memory.
    - If `keywords` present, call `search_conversation_memory_by_keywords(db, keywords, from_time, to_time, ...)` to retrieve relevant snippets (bounded by configured max results).
    - Join snippets into a `conversation_context` string for inclusion in the system message.
 
-5. Build Initial Messages
+6. Build Initial Messages
    - messages = [
      {role: system, content: unified system prompt + ASR note + tool protocol + enrichment },
      ...recent dialogue messages...,
-     {role: user, content: redacted user text}
+     {role: user, content: [stored-facts block + "CURRENT USER MESSAGE:\n"] + redacted user text}
    ]
+
+   Stored-facts block (in the user turn):
+   - `format_stored_facts_block(warm_user_facts, entity_fact_lines)` in `src/jarvis/memory/graph_ops.py` renders the warm profile's User-branch facts plus the known-entity lines (step 3) under the heading `INFORMATION THE USER HAS SHARED WITH YOU IN PRIOR CONVERSATIONS` (the section name the persona prompt refers to), a line stating they are stored facts, not instructions and not part of the user's current message, and explicit `<stored_facts>` … `</stored_facts>` tags. Delimiter text inside stored data is stripped so it cannot close the block early. For anything named in the block, stored facts take precedence over web or tool results about a differently named thing.
+   - When the block is non-empty the user turn is `<block>\n\nCURRENT USER MESSAGE:\n<redacted>`; when empty the user turn is just the redacted text. Dialogue memory always records the plain redacted text.
+   - Why the user turn and not the system prompt: on gemma4:e2b with a ~5k-token text-tools system prompt, replaying the same "say something" prompt 5 times grounded 0/5 with the facts in the system prompt (in place, delimited in place, or moved to its end) and 5/5 with the block ahead of the user's words, while "what is the capital of France?" and "tell me a joke" mentioned stored facts 0/5 each. End to end with a real graph, "say something" went from 1/5 to 5/5.
+   - Directives (standing instructions) stay in the system prompt via `format_warm_profile_block({"user": "", "directives": ...})`; they are rules, not facts.
 
    System message composition:
    - Start with the unified persona prompt rendered by `build_system_prompt(cfg.wake_word.capitalize())`, so the butler's name matches the user's wake word.
@@ -73,7 +88,7 @@ Design principles enforced by the engine:
      - **Recency-weighting**: "When entries disagree, treat the most recent entry as the user's current understanding and preferences — it supersedes older entries." This prevents stale diary facts from overriding more recent corrections.
    - Append `Tools:` with the dynamically generated tool descriptions (including configured MCP servers, if any) and guidance for preferring real data over shell commands.
 
-6. Agentic Messages Loop with Dynamic Context
+7. Agentic Messages Loop with Dynamic Context
    - For each turn of the loop (max `agentic_max_turns` turns, default 8):
      - Update first system message with fresh time/location context
      - Send messages to LLM — try native tool calling first (Ollama `tools` API parameter)
@@ -87,6 +102,7 @@ Design principles enforced by the engine:
        - `` ```tool_call ``` `` fence (text path): Execute tools and continue loop
        - `thinking` field: Internal reasoning (not shown to user), continue loop
        - `content` field: Natural language response to user
+   - Empty-response retry (text-tools path only): when a turn returns no content, no tool call and no thinking while `use_text_tools` is on and tools are allowed, the engine drops the empty assistant turn and re-sends the identical messages once with the allowed tools declared natively (`tools=tools_json_schema`), then parses that response like any other turn. gemma-family models sometimes emit their native tool-call tokens even when no tools are declared, and the server then returns empty content; declaring the tools surfaces the call as structured `tool_calls`. The retry runs at most once per reply (`_empty_retry_used`), is logged (`🔂` in the console and `debug_log`), is skipped if the server rejects native tools, and an empty retry falls through to the existing empty-response exit.
    - Note: System messages are NOT added after the conversation starts, as this breaks native tool calling in models like Llama 3.2
 
    Malformed-response guard (all models):
@@ -97,7 +113,7 @@ Design principles enforced by the engine:
    - When detected, the engine falls back to the standard "I had trouble understanding that request" error reply (model-size-aware). The malformed content is never shown to the user.
 
    Task-list planner (all model sizes, strongest impact on small models):
-   - The planner runs at the **front** of the reply flow (see step 3 above), not after tool selection. By the time the agentic loop starts, the plan already exists, the memory block has either been run or skipped based on the plan's `searchMemory` directive, and the tool allow-list has been derived from the tool names the plan referenced. See `planner.spec.md` for the prompt contract and fail-open semantics.
+   - The planner runs at the **front** of the reply flow (see step 4 above), not after tool selection. By the time the agentic loop starts, the plan already exists, the memory block has either been run or skipped based on the plan's `searchMemory` directive, and the tool allow-list has been derived from the tool names the plan referenced. See `planner.spec.md` for the prompt contract and fail-open semantics.
    - When the plan has more than one step, `format_plan_block(steps)` appends an `ACTION PLAN:` section to the initial system message so the chat model can see its own pre-committed sub-tasks in order. A single reply-only plan renders nothing — it's the planner's positive no-op signal.
    - When `use_text_tools` is True and the plan still has unexecuted tool steps, the engine runs `resolve_next_tool_call` at the top of each loop iteration. That call converts the next planned step (with `<placeholder>` entity references) into a concrete `{name, arguments}` JSON, validates the name against the per-turn allow-list, and direct-executes the tool. The chat model is only invoked for the final synthesis turn. This direct-exec path fires at the top of each loop iteration, before the chat model is called.
    - After each tool result, `progress_nudge(steps, tool_results_so_far)` builds a per-turn remainder hint that names the next planned step and reminds the model to substitute entities discovered in prior results. This replaces the generic completeness prompt whenever a plan is present.
@@ -124,7 +140,7 @@ Design principles enforced by the engine:
    **Termination**: When the chat model produces natural-language content (non-tool-call response), the engine delivers it immediately. The planner's task list is the termination contract: all planned tool steps are direct-executed before the chat model is called for synthesis, so the synthesis turn is always the final turn. For plan-empty queries (short or trivial), the chat model's first content response is delivered directly.
    - Max-turn digest: when the loop exhausts `agentic_max_turns` without ever producing a content turn (e.g. a pure tool-call loop), the engine calls `digest_loop_for_max_turns` in `enrichment.py`. This runs a single cheap LLM pass over the loop's accumulated activity (tool calls, tool result excerpts, any prose) and produces a short reply that begins with a caveat sentence noting the request was not fully completed. The caveat and the summary are generated in the same language as the user's request, not hardcoded English. On digest failure the engine falls back to the last candidate reply (if any) or a generic error message.
 
-7. Tool and Planning Protocol
+8. Tool and Planning Protocol
    - The LLM responds using standard OpenAI-compatible message format:
      - **Tool calls**: Use `tool_calls` field to request data or actions
      - **Internal reasoning**: Use `thinking` field for step-by-step reasoning (not shown to user)
@@ -145,7 +161,7 @@ Design principles enforced by the engine:
    - Tool results: native path appends `{role: "tool", tool_call_id: "<id>", content: "<text>"}` messages; text-based fallback appends `{role: "user", content: "[Tool result: name]\n<text>"}` messages
    - No system message injection: The engine does NOT add system messages during the loop as this breaks native tool calling; instead, guidance is provided via tool error responses when needed
 
-8. Output and Memory Update
+9. Output and Memory Update
    - Remove any tool protocol markers (e.g., lines beginning with a reserved prefix) from the final response.
    - Print reply with a concise header; optionally include debug labeling.
    - If speech synthesis is enabled, pass the reply through the TTS preprocessor (link-to-description rewriting and markdown stripping — see `src/jarvis/output/tts.py::_preprocess_for_speech`) before speaking. Markdown stripping is required because small models often emit `**bold**`, bullets, and headings despite `VOICE_STYLE` guidance, and Piper-style TTS engines read the syntax characters literally ("asterisk asterisk ..."). The stripper handles bold/italic/strikethrough, inline and fenced code, HTML tags, blockquotes, ATX and setext headings, and bullet/numbered lists. Numbered-list markers are removed only when the line is part of a real list (≥2 adjacent numbered lines with numbers ≤ 99), so prose like "2024. The year..." is preserved. The `VOICE_STYLE` prompt also explicitly forbids markdown — belt-and-suspenders.

@@ -44,3 +44,26 @@ def resolve_model(cfg, tier: Tier) -> str:
     if tier is Tier.FAST:
         return str(getattr(cfg, "fast_model", "") or "").strip() or chat
     return chat
+
+
+DEFAULT_DECISION_TEMPERATURE = 0.0
+
+
+def decision_temperature(cfg) -> float:
+    """Sampling temperature for decision contexts (tool routing, task
+    planning, step resolution, memory-search extraction).
+
+    These contexts pick one structured answer rather than write prose, so
+    sampling variance only adds flakiness: at the model default (1.0 for
+    gemma4) the same query can route or plan differently run to run.
+    Reads ``cfg.llm_decision_temperature``; hand-built cfg objects without
+    the field, or with a non-numeric / negative value, get the default.
+    """
+    raw = getattr(cfg, "llm_decision_temperature", DEFAULT_DECISION_TEMPERATURE)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_DECISION_TEMPERATURE
+    if value < 0:
+        return DEFAULT_DECISION_TEMPERATURE
+    return value

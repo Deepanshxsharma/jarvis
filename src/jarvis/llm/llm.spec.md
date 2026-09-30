@@ -35,7 +35,7 @@ Two interchangeable styles dispatch to the same backend:
 
 | Method | Returns | Contract |
 |--------|---------|----------|
-| `direct(model, system, user, *, timeout_sec, thinking, temperature, max_tokens)` | `Optional[str]` | Single-shot system+user. Returns assistant text, or `None` on timeout / error / empty content. `max_tokens` caps generation length — essential for small reasoning models on classification tasks. |
+| `direct(model, system, user, *, timeout_sec, thinking, temperature, max_tokens, json_schema)` | `Optional[str]` | Single-shot system+user. Returns assistant text, or `None` on timeout / error / empty content. `max_tokens` caps generation length — essential for small reasoning models on classification tasks. `json_schema` (optional) constrains decoding to JSON matching the schema: Ollama sends it as the top-level `format` field, the OpenAI-compatible backend as `response_format: {type: "json_schema", json_schema: {name, schema}}`. Callers still validate the result, since a generation cut off by `max_tokens` can end mid-object. |
 | `streaming(model, system, user, *, on_token, timeout_sec, thinking)` | `Optional[str]` | Streams tokens via `on_token`; returns the concatenated full text or `None` if no content was produced. |
 | `chat(model, messages, *, timeout_sec, extra_options, tools, thinking, on_text, cancel)` | `Optional[Dict]` | Arbitrary messages array. Returns the raw response dict so callers (today: the reply engine) can inspect `content` and `tool_calls`. `on_text(piece)` receives content pieces as they are generated and `cancel` (a `threading.Event`) abandons the request, returning `None`; see Streaming. Raises `ToolsNotSupportedError` when the model rejects native tools. Re-raises `requests.ConnectionError` so callers can distinguish "server unreachable" from a transient HTTP failure. |
 | `embed(text, model, *, timeout_sec)` | `Optional[List[float]]` | Vector embedding. Returns `None` on error or when the runtime does not expose embeddings. |
@@ -91,6 +91,10 @@ Every LLM context runs on one of two models, resolved through `resolve_model(cfg
 | `Tier.CHAT` | `cfg.llm_chat_model` | main reply loop, planner + plan-step resolver, summariser, graph extraction, tool-specific calls, memory/tool-result digests (size-gated passes on the chat model) | the model picked at setup |
 
 Fast-tier contexts take a few thousand tokens in and emit tiny strict-JSON answers, so latency dominates; chat-tier contexts produce long-form output, so quality dominates. Contexts state their tier instead of defining a per-context fallback chain, and any future routing logic lands in exactly one place.
+
+### Decision temperature
+
+Decision contexts pick one structured answer rather than write prose: the tool router (and `toolSearchTool`), the planner, the plan-step resolver and the enrichment extractor. They sample at `decision_temperature(cfg)` from `tiers.py`, which reads `cfg.llm_decision_temperature` (config key, default `0.0`; negative or non-numeric values fall back to `0.0`, and hand-built cfg objects without the field get `0.0`). At the model default (1.0 for gemma4) the same query could route or plan differently run to run. The main reply loop and the digests keep the model's own sampling. Greedy decoding on Ollama is close to, but not strictly, deterministic: prompt-cache reuse can still flip near-tie decisions between runs.
 
 ### Factory dispatch
 

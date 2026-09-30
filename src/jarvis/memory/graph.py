@@ -732,6 +732,71 @@ class GraphMemoryStore:
         debug_log(f"Graph search for '{query}' found {len(nodes)} nodes", "memory")
         return nodes
 
+    def find_nodes_named_in(
+        self,
+        text: str,
+        limit: int = 3,
+        exclude_branches: frozenset[str] = frozenset(),
+    ) -> list[MemoryNode]:
+        """Return data-bearing nodes whose name the text mentions.
+
+        Deterministic and LLM-free: a node matches when its name's word
+        sequence appears in ``text`` (case-insensitive, whole words), or
+        when its name with spacing removed equals a run of adjacent words
+        in ``text`` (so "Nova Forge" still finds "NovaForge"). Names shorter
+        than 3 characters never match. Nodes under ``exclude_branches`` are
+        skipped. Longer (more specific) names rank first; matched nodes
+        are touched like search hits.
+        """
+        text_tokens = re.findall(r"\w+", (text or "").casefold())
+        if not text_tokens:
+            return []
+
+        def _mentions(name: str) -> bool:
+            name_tokens = re.findall(r"\w+", name.casefold())
+            compact = "".join(name_tokens)
+            if len(compact) < 3:
+                return False
+            n = len(name_tokens)
+            for i in range(len(text_tokens) - n + 1):
+                if text_tokens[i:i + n] == name_tokens:
+                    return True
+            for i in range(len(text_tokens)):
+                joined = ""
+                for tok in text_tokens[i:i + n + 2]:
+                    joined += tok
+                    if joined == compact:
+                        return True
+                    if len(joined) >= len(compact):
+                        break
+            return False
+
+        excluded_ids = {"root"} | set(FIXED_BRANCH_IDS)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, name FROM memory_nodes WHERE data != '' AND name != ''"
+            ).fetchall()
+        candidate_ids = [
+            r["id"] for r in rows
+            if r["id"] not in excluded_ids and _mentions(r["name"])
+        ]
+
+        nodes: list[MemoryNode] = []
+        for node_id in candidate_ids:
+            if exclude_branches:
+                path_ids = {a.id for a in self.get_ancestors(node_id)}
+                if path_ids & exclude_branches:
+                    continue
+            node = self.get_node(node_id)
+            if node is not None:
+                nodes.append(node)
+        nodes.sort(key=lambda n: len(n.name), reverse=True)
+        nodes = nodes[:limit]
+        for node in nodes:
+            self.touch_node(node.id)
+        debug_log(f"Graph name lookup matched {len(nodes)} nodes", "memory")
+        return nodes
+
     def find_node_by_name(self, name: str, parent_id: Optional[str] = None) -> Optional[MemoryNode]:
         """Find a node by exact name match (case-insensitive), optionally under a specific parent."""
         with self._lock:

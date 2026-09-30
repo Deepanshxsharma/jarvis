@@ -63,7 +63,9 @@ Note: embedding is **not** the default strategy because nomic-embed-text produce
 When the reply engine passes a `context_hint`, it is split into two labelled semantic slots in the router system prompt:
 
 - **KNOWN FACTS** — things the assistant can already see (current time, detected location). If the query is answerable purely from these, the router should return `none`.
-- **RECENT DIALOGUE** — recent user/assistant turns. The router is instructed to read the current query as a continuation of this exchange, so short follow-ups (e.g. "I'm in London" after "which city?") route to the tool that answers the combined intent across turns rather than being treated as idle chatter.
+- **RECENT DIALOGUE** — recent user/assistant turns, labelled as background only: `"RECENT DIALOGUE (background only — use it to resolve what 'it', 'there', 'that' or a bare follow-up refers to; it is NOT the current request):"`. The system prompt still tells the router that short follow-ups (e.g. "I'm in London" after "which city?") route to the tool that answers the combined intent across turns rather than being treated as idle chatter.
+  - Why the label: the earlier label ("interpret the current query as a continuation of this exchange") anchored the router on the previous topic, so a new request after a weather exchange ("What time does CEX close?") routed to `getWeather`. On an 18-case probe at temperature 0 (gemma4:e2b) the background label scored 17/18 against 16/18 for the old label, and the reference follow-up "When was it released?" now routes correctly. Rewording the system-prompt sentence to drop "continuation" was measured too and lost 3 to 4 short follow-ups (14/18 or 15/18), so it was kept.
+  - The router call samples at `decision_temperature(cfg)` (passed as `llm_temperature` by the engine and by `toolSearchTool`); `None` leaves the model default.
 
 The split is the exact marker `"Recent dialogue (short-term memory):"` — any content before it is known facts, content after it is recent dialogue. If no dialogue marker is present, the whole hint is treated as known facts.
 
@@ -80,6 +82,8 @@ def select_tools(
     llm_timeout_sec: float = 8.0,
     embed_model: str = "",
     embed_timeout_sec: float = 10.0,
+    context_hint: Optional[str] = None,
+    llm_temperature: Optional[float] = None,
 ) -> List[str]:
     """Return list of tool names relevant to the query."""
 ```

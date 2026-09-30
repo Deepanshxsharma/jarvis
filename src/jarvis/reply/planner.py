@@ -40,7 +40,7 @@ import re
 from typing import List, Optional, Sequence, Tuple
 
 from ..debug import debug_log
-from ..llm import get_llm_backend, resolve_model, Tier
+from ..llm import decision_temperature, get_llm_backend, resolve_model, Tier
 
 
 def call_llm_direct(*, cfg, chat_model, system_prompt, user_content,
@@ -243,6 +243,7 @@ def _build_user_message(
     query: str,
     dialogue_context: str,
     tools: Sequence[Tuple[str, str]],
+    stored_facts: str = "",
 ) -> str:
     parts = []
     if tools:
@@ -254,6 +255,15 @@ def _build_user_message(
         parts.append(f"DIALOGUE CONTEXT (most recent last):\n{dialogue_context.strip()}")
     else:
         parts.append("DIALOGUE CONTEXT: (empty)")
+    if stored_facts.strip():
+        # Only present when the query names something the user's memory
+        # holds facts about; absent otherwise so unrelated plans are unchanged.
+        parts.append(
+            "STORED FACTS FROM MEMORY (the main assistant already has these; "
+            "no tool or memory search is needed to surface them. Plan a tool "
+            "step only for what they do not answer):\n"
+            f"{stored_facts.strip()}"
+        )
     parts.append(f"USER QUERY: {query.strip()}")
     parts.append("\nEmit the plan now, one step per line, no numbering.")
     return "\n\n".join(parts)
@@ -431,6 +441,7 @@ def plan_query(
     *,
     timeout_sec: Optional[float] = None,
     memory_context: str = "",  # deprecated; planner now runs before memory
+    stored_facts: str = "",
 ) -> List[str]:
     """Run a short planning LLM pass over the query + dialogue context.
 
@@ -444,6 +455,11 @@ def plan_query(
     callers but no longer used: the planner runs before memory search
     so it decides *whether* memory is needed, via the searchMemory
     directive, rather than consulting memory itself.
+
+    ``stored_facts`` carries graph facts about entities the query names,
+    found by the engine's deterministic name lookup before planning. When
+    present they appear as their own labelled block so the planner does
+    not plan a web search for something memory already answers.
     """
     del memory_context  # intentionally unused since planner now runs first
     if not query or len(query.strip()) < MIN_QUERY_CHARS:
@@ -466,7 +482,7 @@ def plan_query(
     )
 
     system_prompt = _PROMPT_TEMPLATE.format(max_steps=MAX_STEPS)
-    user_content = _build_user_message(query, dialogue_context, tools)
+    user_content = _build_user_message(query, dialogue_context, tools, stored_facts)
 
     try:
         raw = call_llm_direct(
@@ -476,6 +492,7 @@ def plan_query(
             user_content=user_content,
             timeout_sec=effective_timeout,
             thinking=False,
+            temperature=decision_temperature(cfg),
             max_tokens=150,
         )
     except Exception as exc:  # pragma: no cover — defensive
@@ -763,6 +780,7 @@ def resolve_next_tool_call(
             user_content=user_content,
             timeout_sec=effective_timeout,
             thinking=False,
+            temperature=decision_temperature(cfg),
             max_tokens=100,
         )
     except Exception as exc:  # pragma: no cover — defensive

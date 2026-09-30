@@ -32,7 +32,7 @@ from .backend import LLMBackend, ToolsNotSupportedError
 from .ollama import OllamaBackend, check_version, extract_text_from_response
 from .openai_compatible import OpenAICompatibleBackend, ServerCapabilities
 from .factory import get_embedding_backend, get_llm_backend
-from .tiers import Tier, resolve_model
+from .tiers import Tier, decision_temperature, resolve_model
 
 __all__ = [
     "LLMBackend",
@@ -44,6 +44,7 @@ __all__ = [
     "check_version",
     "get_llm_backend",
     "get_embedding_backend",
+    "decision_temperature",
     "resolve_model",
     "extract_text_from_response",
     "call_llm_direct",
@@ -61,6 +62,7 @@ def call_llm_direct(
     thinking: bool = False,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Single-shot system+user call against an Ollama instance at
     ``base_url``. Convenience helper for callers that only have a base
@@ -74,6 +76,7 @@ def call_llm_direct(
         thinking=thinking,
         temperature=temperature,
         max_tokens=max_tokens,
+        json_schema=json_schema,
     )
 
 
